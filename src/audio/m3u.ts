@@ -251,6 +251,7 @@ export async function ensureAudioFromPlaylist(
 
   return fetcher.runExclusiveAudio(async () => {
     const referer = book.url || `${config.source.baseUrl}/`;
+    log.info(`audio ${book.source_id}: fetching player token/playlist`);
     const player = await fetchPlayerBookData(fetcher, book.source_id, referer, { hls: true });
     if (player.isPaidPreview) {
       throw new Error(`book ${book.source_id} is paid (preview only)`);
@@ -261,6 +262,9 @@ export async function ensureAudioFromPlaylist(
     const chapters = chaptersForBook(player);
     const outputName = `${String(book.source_id).padStart(4, "0")}-${safeSlug(book.slug || book.title)}.m4b`;
     const outputPath = join(dir, outputName);
+    log.info(
+      `audio ${book.source_id}: ${media.kind}, ${chapters.length} chapter(s) → ${outputName}`,
+    );
 
     const manifest: TracksManifest = {
       mediaUrl: media.url,
@@ -276,6 +280,7 @@ export async function ensureAudioFromPlaylist(
     await writeFile(join(dir, CHAPTERS_FILE), `${JSON.stringify(manifest.chapters, null, 2)}\n`);
 
     if (media.kind === "mp3") {
+      log.info(`audio ${book.source_id}: downloading single mp3`);
       const binary = await fetcher.getBinary(media.url, {
         referer,
         timeoutMs: config.audio.trackTimeoutMs,
@@ -283,10 +288,21 @@ export async function ensureAudioFromPlaylist(
       });
       const mp3Path = join(dir, ".tmp-source.mp3");
       await writeFile(mp3Path, binary.bytes);
+      log.info(`audio ${book.source_id}: remuxing mp3 → m4b with chapters`);
       await remuxWithChapters(mp3Path, outputPath, chapters, book.title);
       await rm(mp3Path, { force: true });
     } else {
-      await downloadHlsAndRemux(media.url, dir, outputPath, chapters, book.title, config, fetcher, referer);
+      await downloadHlsAndRemux(
+        media.url,
+        dir,
+        outputPath,
+        chapters,
+        book.title,
+        config,
+        fetcher,
+        referer,
+        book.source_id,
+      );
     }
 
     await writeFile(join(dir, AUDIO_MARKER), `${new Date().toISOString()}\n`);
@@ -309,10 +325,12 @@ async function downloadHlsAndRemux(
   config: Config,
   fetcher: Fetcher,
   referer: string,
+  sourceId: number,
 ): Promise<void> {
   const hlsDir = join(dir, "hls");
   await mkdir(hlsDir, { recursive: true });
 
+  log.info(`audio ${sourceId}: fetching HLS playlist`);
   let currentUrl = playlistUrl;
   let playlistBody = (
     await fetcher.getText(currentUrl, { referer, timeoutMs: config.audio.playlistTimeoutMs })
@@ -327,9 +345,16 @@ async function downloadHlsAndRemux(
   if (segments.length === 0) throw new Error(`HLS playlist has no segments: ${currentUrl}`);
 
   if (keyUrl) {
+    log.info(`audio ${sourceId}: downloading HLS encryption key`);
     const key = await fetcher.getBinary(keyUrl, { referer, timeoutMs: config.audio.trackTimeoutMs });
     await writeFile(join(hlsDir, "enc.key"), key.bytes);
   }
+
+  const total = segments.length;
+  const progress = createSegmentProgress(sourceId, total);
+  log.info(
+    `audio ${sourceId}: downloading ${total} HLS segment(s) (concurrency ${config.audio.trackConcurrency})`,
+  );
 
   // Rewrite playlist to local segment names for ffmpeg.
   const localNames: string[] = [];
@@ -337,7 +362,10 @@ async function downloadHlsAndRemux(
     const name = `seg-${String(index).padStart(5, "0")}.ts`;
     localNames[index] = name;
     const dest = join(hlsDir, name);
-    if (await fileLooksComplete(dest, config.audio.minFileBytes)) return;
+    if (await fileLooksComplete(dest, config.audio.minFileBytes)) {
+      progress.tick(true);
+      return;
+    }
     const binary = await fetcher.getBinary(url, {
       referer,
       timeoutMs: config.audio.trackTimeoutMs,
@@ -346,7 +374,9 @@ async function downloadHlsAndRemux(
     const tmp = join(hlsDir, `.tmp-${name}`);
     await writeFile(tmp, binary.bytes);
     await rename(tmp, dest);
+    progress.tick(false);
   });
+  progress.done();
 
   const localPlaylist = playlistBody
     .split(/\r?\n/)
@@ -388,6 +418,7 @@ async function downloadHlsAndRemux(
   void localPlaylist;
 
   const concatPath = join(hlsDir, "concat.txt");
+  log.info(`audio ${sourceId}: ffmpeg remux ${localNames.length} segment(s) → ${basename(outputPath)}`);
   // Prefer concat demuxer of .ts files — more reliable than encrypted local m3u8 if key path issues.
   if (!keyUrl) {
     await writeFile(concatPath, localNames.map((n) => `file '${n.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
@@ -415,7 +446,42 @@ async function downloadHlsAndRemux(
 
   // Drop bulky HLS workspace after success.
   await rm(hlsDir, { recursive: true, force: true });
-  log.info(`remuxed ${localNames.length} segments → ${basename(outputPath)}`);
+  log.info(`audio ${sourceId}: done → ${basename(outputPath)}`);
+}
+
+/** Log segment download progress with remaining count and ETA. */
+function createSegmentProgress(sourceId: number, total: number) {
+  const startedAt = Date.now();
+  let done = 0;
+  let skipped = 0;
+  let lastLogAt = 0;
+  const step = Math.max(1, Math.min(25, Math.ceil(total / 10)));
+
+  const emit = (force = false) => {
+    const now = Date.now();
+    if (!force && done < total && done % step !== 0 && now - lastLogAt < 15_000) return;
+    lastLogAt = now;
+    const left = total - done;
+    const elapsedSec = Math.max(0.001, (now - startedAt) / 1000);
+    const rate = done / elapsedSec;
+    const etaSec = rate > 0 && left > 0 ? Math.round(left / rate) : null;
+    const eta = etaSec === null ? "?" : etaSec < 60 ? `${etaSec}s` : `${Math.round(etaSec / 60)}m`;
+    const skipNote = skipped > 0 ? `, ${skipped} cached` : "";
+    log.info(
+      `audio ${sourceId}: segments ${done}/${total} (${left} left, ~${eta})${skipNote}`,
+    );
+  };
+
+  return {
+    tick(wasCached: boolean) {
+      done += 1;
+      if (wasCached) skipped += 1;
+      emit(false);
+    },
+    done() {
+      emit(true);
+    },
+  };
 }
 
 async function remuxWithChapters(
