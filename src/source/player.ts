@@ -48,6 +48,11 @@ export function playerPassphrase(): string {
   return out;
 }
 
+/** Fallback key from `plh.assets2()` — current akniga builds encrypt `hres` with this. */
+export function playerPassphraseFallback(): string {
+  return "EKxtcg46V";
+}
+
 /** OpenSSL EVP_BytesToKey (MD5) as used by CryptoJS default AES. */
 export function evpBytesToKey(password: string, salt: Buffer, keyLen = 32, ivLen = 16): { key: Buffer; iv: Buffer } {
   const pass = Buffer.from(password, "utf8");
@@ -64,7 +69,7 @@ export function evpBytesToKey(password: string, salt: Buffer, keyLen = 32, ivLen
  * Decrypt CryptoJS JSON ciphertext (`{ct,iv,s}`) produced for `hres` / `res`.
  * Returns the UTF-8 plaintext (usually a JSON-encoded URL string).
  */
-export function decryptCryptoJsPayload(payload: string, passphrase = playerPassphrase()): string {
+export function decryptCryptoJsPayload(payload: string, passphrase: string): string {
   const obj = JSON.parse(payload) as { ct: string; iv?: string; s?: string };
   if (!obj.ct || !obj.s) throw new Error("Invalid CryptoJS payload");
   const ct = Buffer.from(obj.ct, "base64");
@@ -75,15 +80,32 @@ export function decryptCryptoJsPayload(payload: string, passphrase = playerPassp
   return plain.toString("utf8");
 }
 
-/** `plh.getHres` equivalent: decrypt then JSON.parse. */
-export function getHres(encrypted: string, passphrase = playerPassphrase()): string {
-  const utf8 = decryptCryptoJsPayload(encrypted, passphrase);
+function parseDecryptedHres(utf8: string): string {
   const parsed = JSON.parse(utf8) as unknown;
   if (typeof parsed === "string") return parsed;
   if (parsed && typeof parsed === "object" && "url" in (parsed as object)) {
     return String((parsed as { url: string }).url);
   }
   throw new Error("Unexpected decrypted hres shape");
+}
+
+/**
+ * `plh.getHres` equivalent: try `assets()` then `assets2()` (same order as the site player).
+ */
+export function getHres(encrypted: string, passphrase?: string): string {
+  if (passphrase !== undefined) {
+    return parseDecryptedHres(decryptCryptoJsPayload(encrypted, passphrase));
+  }
+  const keys = [playerPassphrase(), playerPassphraseFallback()];
+  let lastError: unknown;
+  for (const key of keys) {
+    try {
+      return parseDecryptedHres(decryptCryptoJsPayload(encrypted, key));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function parseChapters(raw: unknown): PlayerChapter[] {

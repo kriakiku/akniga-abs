@@ -6,7 +6,7 @@ import {
   parseHlsSegments,
   resolveMediaPlaylist,
 } from "../src/audio/m3u.ts";
-import { decryptCryptoJsPayload, evpBytesToKey, getHres, playerPassphrase } from "../src/source/player.ts";
+import { decryptCryptoJsPayload, evpBytesToKey, getHres, playerPassphrase, playerPassphraseFallback } from "../src/source/player.ts";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
 
 describe("hls playlist parsing", () => {
@@ -63,23 +63,33 @@ describe("player decrypt", () => {
   test("passphrase is stable", () => {
     expect(playerPassphrase().startsWith("ymXEKzvUkuo5G0")).toBe(true);
     expect(playerPassphrase().length).toBeGreaterThan(14);
+    expect(playerPassphraseFallback()).toBe("EKxtcg46V");
   });
 
-  test("round-trip CryptoJS-compatible payload", () => {
-    const passphrase = playerPassphrase();
+  function seal(passphrase: string, url: string): string {
     const salt = randomBytes(8);
     const { key, iv } = evpBytesToKey(passphrase, salt);
-    const plaintext = JSON.stringify("https://r1.akniga.club/b/1/pl.m3u8");
+    const plaintext = JSON.stringify(url);
     const cipher = createCipheriv("aes-256-cbc", key, iv);
     const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-    const payload = JSON.stringify({
+    return JSON.stringify({
       ct: encrypted.toString("base64"),
       iv: iv.toString("hex"),
       s: salt.toString("hex"),
     });
-    const url = getHres(payload, passphrase);
-    expect(url).toBe("https://r1.akniga.club/b/1/pl.m3u8");
-    expect(decryptCryptoJsPayload(payload, passphrase)).toBe(plaintext);
+  }
+
+  test("round-trip CryptoJS-compatible payload", () => {
+    const passphrase = playerPassphrase();
+    const payload = seal(passphrase, "https://r1.akniga.club/b/1/pl.m3u8");
+    expect(getHres(payload, passphrase)).toBe("https://r1.akniga.club/b/1/pl.m3u8");
+    expect(decryptCryptoJsPayload(payload, passphrase)).toBe(JSON.stringify("https://r1.akniga.club/b/1/pl.m3u8"));
     void createHash;
+  });
+
+  test("getHres falls back to assets2 key", () => {
+    const payload = seal(playerPassphraseFallback(), "https://r1.akniga.club/b/3167/pl.m3u8");
+    expect(() => getHres(payload, playerPassphrase())).toThrow();
+    expect(getHres(payload)).toBe("https://r1.akniga.club/b/3167/pl.m3u8");
   });
 });
