@@ -1,5 +1,5 @@
 import type { AppContext } from "../context.ts";
-import { nowIso } from "../db.ts";
+import { nowIso, setMeta } from "../db.ts";
 import { logger } from "../log.ts";
 import { groupByWork, type WorkGroup } from "../catalog/select.ts";
 import { booksForSubscription, getBook, type BookWithPeople } from "../catalog/store.ts";
@@ -57,8 +57,7 @@ export async function refreshQueue(ctx: AppContext, options: { crawlFacets?: boo
     alreadyQueued: 0,
   };
 
-  // Pulling the facet listing first makes sure newly published volumes are known even when
-  // the sitemap has not been re-read yet.
+  // Crawl facet listings first so newly published volumes are known before queueing.
   if (options.crawlFacets) {
     for (const subscription of enabled) {
       const type = subscription.type;
@@ -142,6 +141,7 @@ export async function refreshQueue(ctx: AppContext, options: { crawlFacets?: boo
   log.info(
     `subscriptions: ${result.subscriptions}, matched ${result.matched}, deduped ${result.deduped}, queued ${result.queued}, alreadyQueued ${result.alreadyQueued}, alreadyLinked ${result.alreadyLinked}`,
   );
+  setMeta(ctx.db, "subscriptions_ran_at", new Date().toISOString());
   return result;
 }
 

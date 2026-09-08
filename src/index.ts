@@ -1,6 +1,6 @@
 import { AppContext } from "./context.ts";
 import { logger } from "./log.ts";
-import { backfillDetails, seedEntities, syncSitemap } from "./jobs/crawl.ts";
+import { backfillDetails, seedEntities } from "./jobs/crawl.ts";
 import { Scheduler } from "./jobs/scheduler.ts";
 import { refreshQueue } from "./jobs/subscriptions.ts";
 import { syncLibrary } from "./jobs/sync.ts";
@@ -14,11 +14,10 @@ const USAGE = `akniga-abs - akniga.org audiobook metadata for Audiobookshelf
 Usage:
   akniga-abs [serve]        Start the web UI and the scheduler (default)
   akniga-abs seed           Fetch the author and narrator indexes
-  akniga-abs sitemap        Best-effort sitemap reconcile (subscriptions are primary)
   akniga-abs backfill [n]   Fetch up to n pending detail pages (default: config value)
   akniga-abs subscriptions  Re-evaluate subscriptions and refill the news queue
   akniga-abs sync           Write sidecars into the Audiobookshelf library
-  akniga-abs once           sitemap, then subscriptions, then sync
+  akniga-abs once           subscriptions, then sync
   akniga-abs --version      Print the version
 
 Environment:
@@ -85,9 +84,6 @@ async function main(): Promise<void> {
       case "seed":
         console.log(JSON.stringify(await seedEntities(ctx), null, 2));
         break;
-      case "sitemap":
-        console.log(JSON.stringify(await syncSitemap(ctx), null, 2));
-        break;
       case "backfill": {
         const limit = Number.parseInt(rest[0] ?? "", 10);
         const batch = Number.isFinite(limit) ? limit : ctx.config.schedule.backfillBatch;
@@ -104,7 +100,6 @@ async function main(): Promise<void> {
         break;
       }
       case "once": {
-        await syncSitemap(ctx);
         await refreshQueue(ctx, { crawlFacets: true });
         if (ctx.abs.configured) {
           const result = await syncLibrary(ctx);

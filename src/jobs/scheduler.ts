@@ -1,7 +1,7 @@
 import type { AppContext } from "../context.ts";
 import { getMeta, pruneFetchLog, setMeta } from "../db.ts";
 import { logger } from "../log.ts";
-import { backfillDetails, seedEntities, syncSitemap } from "./crawl.ts";
+import { backfillDetails, seedEntities } from "./crawl.ts";
 import { refreshQueue } from "./subscriptions.ts";
 import { syncLibrary } from "./sync.ts";
 
@@ -66,12 +66,8 @@ export class Scheduler {
       });
     }
 
-    if (schedule.incrementalMinutes > 0 && minutesSince(getMeta(ctx.db, "sitemap_synced_at")) >= schedule.incrementalMinutes) {
-      log.info("due: sitemap + subscriptions");
-      await ctx.runJob("sitemap", () => syncSitemap(ctx)).catch((error) => {
-        log.warn(`sitemap sync failed: ${String(error)}`);
-        return null;
-      });
+    if (schedule.incrementalMinutes > 0 && minutesSince(getMeta(ctx.db, "subscriptions_ran_at")) >= schedule.incrementalMinutes) {
+      log.info("due: subscriptions");
       await ctx.runJob("subscriptions", () => refreshQueue(ctx, { crawlFacets: true })).catch((error) => {
         log.warn(`subscription refresh failed: ${String(error)}`);
         return null;

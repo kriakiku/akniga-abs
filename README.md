@@ -119,5 +119,5 @@ akniga-abs seed             # индексы авторов / исполните
 akniga-abs subscriptions    # обновить очередь по подпискам
 akniga-abs backfill [n]     # детали книг
 akniga-abs sync             # sidecar → библиотека
-akniga-abs once             # sitemap + subs + sync
+akniga-abs once             # subs + sync
 ```

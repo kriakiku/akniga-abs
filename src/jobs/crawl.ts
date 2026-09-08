@@ -4,7 +4,6 @@ import { logger } from "../log.ts";
 import { parseBookPage } from "../source/book.ts";
 import { parseEntityIndex } from "../source/indexes.ts";
 import { parseListingPage } from "../source/listing.ts";
-import { parseBookSitemap, parseSitemapIndex, isArticleSitemapUrl, sitemapIndexUrl } from "../source/sitemap.ts";
 import {
   authorUrl,
   bookUrl,
@@ -19,7 +18,6 @@ import {
   markBookState,
   recordBookDetail,
   recordListingCard,
-  recordSitemapEntry,
   upsertAuthor,
   upsertNarrator,
   type ListingFacet,
@@ -62,55 +60,6 @@ export async function seedEntities(ctx: AppContext): Promise<SeedResult> {
 
   setMeta(ctx.db, "seeded_at", new Date().toISOString());
   log.info(`seeded ${result.authors} authors and ${result.narrators} narrators`);
-  return result;
-}
-
-export interface SitemapResult {
-  total: number;
-  added: number;
-  stale: number;
-}
-
-/**
- * Best-effort sitemap sync. akniga discovery primarily goes through subscriptions;
- * sitemap entries without numeric ids are skipped by the parser.
- */
-export async function syncSitemap(ctx: AppContext): Promise<SitemapResult> {
-  const base = ctx.config.source.baseUrl;
-  const indexUrl = sitemapIndexUrl(base);
-  const result: SitemapResult = { total: 0, added: 0, stale: 0 };
-
-  try {
-    log.info(`fetching sitemap index ${indexUrl}`);
-    const index = await ctx.fetcher.getText(indexUrl);
-    const children = parseSitemapIndex(index.body).filter(isArticleSitemapUrl);
-    const targets = children.length > 0 ? children : [];
-    if (targets.length === 0) {
-      log.info("no usable article sitemaps; relying on subscriptions for discovery");
-      setMeta(ctx.db, "sitemap_synced_at", new Date().toISOString());
-      return result;
-    }
-
-    for (const target of targets) {
-      log.info(`fetching article sitemap ${target}`);
-      const page = await ctx.fetcher.getText(target);
-      const entries = parseBookSitemap(page.body, base);
-      const apply = ctx.db.transaction(() => {
-        for (const entry of entries) {
-          const outcome = recordSitemapEntry(ctx.db, entry);
-          result.total += 1;
-          if (outcome === "new") result.added += 1;
-          if (outcome === "stale") result.stale += 1;
-        }
-      });
-      apply();
-    }
-  } catch (error) {
-    log.warn(`sitemap sync skipped: ${String(error)}`);
-  }
-
-  setMeta(ctx.db, "sitemap_synced_at", new Date().toISOString());
-  log.info(`sitemap: ${result.total} entries, ${result.added} new, ${result.stale} changed`);
   return result;
 }
 
