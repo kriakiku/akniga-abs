@@ -1,4 +1,6 @@
 import * as cheerio from "cheerio";
+import type { Cheerio, CheerioAPI } from "cheerio";
+import type { Element } from "domhandler";
 import {
   DEFAULT_BASE_URL,
   absoluteUrl,
@@ -6,7 +8,6 @@ import {
   parseDurationToSeconds,
   parseSeriesSequence,
 } from "./urls.ts";
-import { isPaidBookPage } from "./book.ts";
 
 export interface ListingCard {
   sourceId: number;
@@ -31,6 +32,55 @@ export interface ListingPage {
   lastPage: number;
   /** Next "load more" URL when present. */
   nextUrl: string | null;
+}
+
+function textOf($: CheerioAPI, node: Cheerio<Element>): string {
+  return node.text().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * akniga cards put "Author(s) – Title" in `h2.caption__article-main`, but the wrapping
+ * `<a class="content__article-main-link">` also contains the description blurb. Always
+ * read the caption (or img alt), never the whole link text.
+ */
+export function extractListingTitle(
+  rawCaption: string,
+  authorNames: string[],
+  altFallback?: string | null,
+): string {
+  let title = rawCaption.replace(/\s+/g, " ").trim();
+  if (!title && altFallback) title = altFallback.replace(/\s+/g, " ").trim();
+  if (!title) return "";
+
+  // Primary pattern on akniga: "Author[, Author2] – Title"
+  const enDash = title.split(/\s+[—–]\s+/);
+  if (enDash.length >= 2) {
+    title = enDash.slice(1).join(" – ").trim();
+  } else {
+    // ASCII "Author - Title" only when the left side matches a known author link.
+    const ascii = /^(.*?)\s+-\s+(.*)$/.exec(title);
+    if (ascii) {
+      const left = ascii[1]!.trim();
+      const right = ascii[2]!.trim();
+      const authorsLower = authorNames.map((n) => n.toLowerCase());
+      if (
+        authorsLower.some((a) => left.toLowerCase() === a || left.toLowerCase().startsWith(`${a},`))
+      ) {
+        title = right;
+      }
+    }
+  }
+
+  // Strip residual leading author fragments (" , Челяев Сергей") if dash-split missed.
+  const authors = [...authorNames].sort((a, b) => b.length - a.length);
+  for (const name of authors) {
+    if (!name) continue;
+    if (title.toLowerCase().startsWith(name.toLowerCase())) {
+      title = title.slice(name.length).replace(/^[\s,]+/, "").replace(/^\s*[—–-]\s*/, "").trim();
+    }
+  }
+  title = title.replace(/^[\s,–—-]+/, "").trim();
+  return title;
 }
 
 /**
@@ -58,19 +108,34 @@ export function parseListingPage(html: string, base = DEFAULT_BASE_URL): Listing
       if (seen.has(sourceId)) return;
       seen.add(sourceId);
 
-      const title =
-        card.find(".caption__article-main, h2, .content__article-main-link").first().text().replace(/\s+/g, " ").trim() ||
-        card.find("a.content__article--link").first().text().replace(/\s+/g, " ").trim();
-      if (!title) return;
-
-      const authorName =
-        card.find('a[href*="/author/"]').first().text().replace(/\s+/g, " ").trim() || null;
+      const authorNames = card
+        .find('a[href*="/author/"]')
+        .toArray()
+        .map((el) => textOf($, $(el)))
+        .filter(Boolean);
+      const authorName = authorNames[0] ?? null;
       const narratorName =
-        card.find('a[href*="/performer/"]').first().text().replace(/\s+/g, " ").trim() || null;
+        textOf($, card.find('a[href*="/performer/"]').first()) || null;
+
+      // Caption h2 is authoritative. The wrapping article link also embeds the blurb —
+      // strip those nodes before falling back to link text (series cards have title-only links).
+      let caption = textOf($, card.find("h2.caption__article-main, .caption__article-main").first());
+      if (!caption) {
+        caption = textOf($, card.find("h2").first());
+      }
+      if (!caption) {
+        const linkEl = card.find("a.content__article--link, a.content__article-main-link").first().clone();
+        linkEl.find(".caption__article--text, .description__article-main, .content__article--image, picture, img").remove();
+        caption = textOf($, linkEl);
+      }
+      const alt =
+        card.find("img.topic, img.js-topic, img").first().attr("alt")?.trim() ?? null;
+      const title = extractListingTitle(caption, authorNames, alt);
+      if (!title) return;
 
       let seriesName: string | null = null;
       let seriesSequence: string | null = null;
-      const seriesText = card.find('a[href*="/series/"]').first().text().replace(/\s+/g, " ").trim();
+      const seriesText = textOf($, card.find('a[href*="/series/"]').first());
       if (seriesText) {
         const parsed = parseSeriesSequence(seriesText);
         seriesName = parsed.name;
@@ -91,22 +156,16 @@ export function parseListingPage(html: string, base = DEFAULT_BASE_URL): Listing
       const slug = ref?.slug ?? `book-${sourceId}`;
       const url = ref?.url ?? absoluteUrl(link, base) ?? `${base.replace(/\/+$/, "")}/${slug}`;
 
-      // Paid cards: title/page snippet without «бесплатно» — for search we also check later on detail.
-      const cardHtml = card.html() ?? "";
+      const linkTitle = card.find("a.content__article-main-link, a.content__article--link").first().attr("title") ?? "";
       const isPaid =
-        /платн/i.test(cardHtml) ||
-        (!/бесплатно/i.test(title) && /слушать онлайн/i.test(card.find("a").first().attr("title") ?? ""));
+        /платн/i.test(card.html() ?? "") ||
+        (!/бесплатно/i.test(linkTitle) && /слушать онлайн/i.test(linkTitle));
 
       cards.push({
         sourceId,
         url,
         slug,
-        title: title.replace(/\s+[—–-]\s+.*$/, (m) => {
-          // Keep "Author – Title" style: akniga often uses "Author – Title synopsis…"
-          const parts = title.split(/\s+[—–-]\s+/);
-          if (parts.length >= 2) return ""; // strip synopsis after first dash? Better keep full and clean below.
-          return m;
-        }).split(/\s{2,}/)[0]!.trim(),
+        title,
         authorName,
         narratorName,
         seriesName,
@@ -123,19 +182,6 @@ export function parseListingPage(html: string, base = DEFAULT_BASE_URL): Listing
     },
   );
 
-  // Clean titles that look like "Author – Title Synopsis…"
-  for (const card of cards) {
-    if (card.authorName && card.title.startsWith(card.authorName)) {
-      card.title = card.title
-        .slice(card.authorName.length)
-        .replace(/^\s*[—–-]\s*/, "")
-        .trim();
-    }
-    // Truncate at long synopsis: title links often include description inline.
-    const cut = card.title.search(/\.\s+[А-ЯA-Z]/);
-    if (cut > 20) card.title = card.title.slice(0, cut + 1).trim();
-  }
-
   let lastPage = 1;
   $(".paging a[href], .pagination a[href]").each((_, element) => {
     const href = $(element).attr("href") ?? "";
@@ -150,6 +196,5 @@ export function parseListingPage(html: string, base = DEFAULT_BASE_URL): Listing
     absoluteUrl($(".js-loadmore-button").attr("data-url"), base) ??
     absoluteUrl($(".paging a:contains('»'), .paging a.next").attr("href"), base);
 
-  void isPaidBookPage;
   return { cards, lastPage, nextUrl: nextUrl ?? null };
 }

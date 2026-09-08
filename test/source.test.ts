@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { isPaidBookPage, parseBookPage, parseChapterListFromHtml } from "../src/source/book.ts";
-import { parseListingPage } from "../src/source/listing.ts";
+import { extractListingTitle, parseListingPage } from "../src/source/listing.ts";
 import {
   authorUrl,
   parseAuthorKey,
@@ -78,12 +78,34 @@ describe("book page", () => {
 });
 
 describe("listing", () => {
+  test("extractListingTitle splits authors and ignores synopsis", () => {
+    expect(
+      extractListingTitle("Зорич Александр, Челяев Сергей – Клад стервятника", [
+        "Зорич Александр",
+        "Челяев Сергей",
+      ]),
+    ).toBe("Клад стервятника");
+    expect(
+      extractListingTitle("Гравицкий Алексей – Зачистка S.T.A.L.K.E.R.", ["Гравицкий Алексей"]),
+    ).toBe("Зачистка S.T.A.L.K.E.R.");
+    expect(extractListingTitle("Новогодний сборник S.T.A.L.K.E.R", ["Нуждин Андрей"])).toBe(
+      "Новогодний сборник S.T.A.L.K.E.R",
+    );
+  });
+
   test("parses search results and pagination", () => {
     const page = parseListingPage(fixture("listing-search.html"));
-    expect(page.cards.length).toBe(2);
+    expect(page.cards.length).toBe(4);
     expect(page.lastPage).toBe(15);
-    expect(page.cards[0]?.sourceId).toBe(3167);
-    expect(page.cards[0]?.seriesSequence).toBe("2");
+    expect(page.cards[0]).toMatchObject({
+      sourceId: 3167,
+      title: "Зачистка S.T.A.L.K.E.R.",
+      seriesSequence: "2",
+    });
+    expect(page.cards.find((c) => c.sourceId === 23322)?.title).toBe("Клад стервятника");
+    expect(page.cards.find((c) => c.sourceId === 47852)?.title).toBe("Новогодний сборник S.T.A.L.K.E.R");
+    // Must not swallow the description blurb that sits inside the same <a>.
+    expect(page.cards.find((c) => c.sourceId === 47852)?.title).not.toContain("привыкли");
   });
 
   test("parses series volume numbers", () => {

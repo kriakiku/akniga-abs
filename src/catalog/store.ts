@@ -150,11 +150,17 @@ export function recordListingCard(db: Db, card: ListingCard, facet?: ListingFace
       nowIso(),
     );
   } else {
+    // Refresh title from listing while detail is still pending — listing parser used to
+    // store empty / author-fragment titles that the UI shows as `#id`.
     db.query(
       `update books set
          url = ?,
          slug = ?,
-         title = case when title = '' then ? else title end,
+         title = case
+           when detail_state = 'pending' and ? != '' then ?
+           when title = '' or title like ',%' then ?
+           else title
+         end,
          cover_url = coalesce(cover_url, ?),
          duration_sec = coalesce(duration_sec, ?),
          rating = coalesce(?, rating),
@@ -163,6 +169,8 @@ export function recordListingCard(db: Db, card: ListingCard, facet?: ListingFace
     ).run(
       card.url,
       card.slug,
+      card.title,
+      card.title,
       card.title,
       card.coverUrl,
       card.durationSec,

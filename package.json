@@ -1,6 +1,6 @@
 {
   "name": "akniga-abs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Scraper for akniga.org audiobook metadata with Audiobookshelf sidecar sync and subscriptions",
   "private": true,
   "type": "module",
