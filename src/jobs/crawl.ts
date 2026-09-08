@@ -1,12 +1,20 @@
 import type { AppContext } from "../context.ts";
-import { logger } from "../log.ts";
 import { getMeta, setMeta } from "../db.ts";
+import { logger } from "../log.ts";
 import { parseBookPage } from "../source/book.ts";
 import { parseEntityIndex } from "../source/indexes.ts";
 import { parseListingPage } from "../source/listing.ts";
 import { parseBookSitemap, parseSitemapIndex, isArticleSitemapUrl, sitemapIndexUrl } from "../source/sitemap.ts";
-import { bookUrl, xfsearchUrl } from "../source/urls.ts";
 import {
+  authorUrl,
+  bookUrl,
+  performerUrl,
+  searchBooksUrl,
+  seriesUrl,
+  sectionUrl,
+} from "../source/urls.ts";
+import {
+  addBookTag,
   booksNeedingDetailForSubscriptions,
   markBookState,
   recordBookDetail,
@@ -14,6 +22,7 @@ import {
   recordSitemapEntry,
   upsertAuthor,
   upsertNarrator,
+  type ListingFacet,
 } from "../catalog/store.ts";
 import { CooldownError } from "../fetch/fetcher.ts";
 
@@ -25,23 +34,30 @@ export interface SeedResult {
 }
 
 /**
- * Populate authors and narrators from the site's two index pages. Two requests give the whole
- * entity space, so subscriptions can be configured long before the detail backfill finishes.
+ * Populate authors and narrators from akniga index pages (best-effort; pages may be paginated).
  */
 export async function seedEntities(ctx: AppContext): Promise<SeedResult> {
   const base = ctx.config.source.baseUrl;
   const result: SeedResult = { authors: 0, narrators: 0 };
 
-  const authorsPage = await ctx.fetcher.getText(`${base}/avtors.html`);
-  for (const entry of parseEntityIndex(authorsPage.body, "avtor", base)) {
-    upsertAuthor(ctx.db, entry);
-    result.authors += 1;
+  try {
+    const authorsPage = await ctx.fetcher.getText(`${base}/authors/`);
+    for (const entry of parseEntityIndex(authorsPage.body, "author", base)) {
+      upsertAuthor(ctx.db, entry);
+      result.authors += 1;
+    }
+  } catch (error) {
+    log.warn(`authors index failed: ${String(error)}`);
   }
 
-  const readersPage = await ctx.fetcher.getText(`${base}/readers.html`);
-  for (const entry of parseEntityIndex(readersPage.body, "chitaet", base)) {
-    upsertNarrator(ctx.db, entry);
-    result.narrators += 1;
+  try {
+    const readersPage = await ctx.fetcher.getText(`${base}/performers/`);
+    for (const entry of parseEntityIndex(readersPage.body, "performer", base)) {
+      upsertNarrator(ctx.db, entry);
+      result.narrators += 1;
+    }
+  } catch (error) {
+    log.warn(`performers index failed: ${String(error)}`);
   }
 
   setMeta(ctx.db, "seeded_at", new Date().toISOString());
@@ -56,34 +72,41 @@ export interface SitemapResult {
 }
 
 /**
- * Walk the sitemap and reconcile it with the local catalogue. Every entry carries a `lastmod`,
- * so only genuinely changed pages get queued for a refetch.
+ * Best-effort sitemap sync. akniga discovery primarily goes through subscriptions;
+ * sitemap entries without numeric ids are skipped by the parser.
  */
 export async function syncSitemap(ctx: AppContext): Promise<SitemapResult> {
   const base = ctx.config.source.baseUrl;
   const indexUrl = sitemapIndexUrl(base);
-  log.info(`fetching sitemap index ${indexUrl}`);
-  const index = await ctx.fetcher.getText(indexUrl);
-  const children = parseSitemapIndex(index.body).filter(isArticleSitemapUrl);
-  const targets = children.length > 0 ? children : [`${base}/news_pages.xml`];
-  log.info(`sitemap index → ${targets.length} article sitemap(s): ${targets.join(", ")}`);
-
   const result: SitemapResult = { total: 0, added: 0, stale: 0 };
 
-  for (const target of targets) {
-    log.info(`fetching article sitemap ${target}`);
-    const page = await ctx.fetcher.getText(target);
-    log.info(`parsed ${target} (${page.body.length} bytes, via ${page.strategy})`);
-    const entries = parseBookSitemap(page.body, base);
-    const apply = ctx.db.transaction(() => {
-      for (const entry of entries) {
-        const outcome = recordSitemapEntry(ctx.db, entry);
-        result.total += 1;
-        if (outcome === "new") result.added += 1;
-        if (outcome === "stale") result.stale += 1;
-      }
-    });
-    apply();
+  try {
+    log.info(`fetching sitemap index ${indexUrl}`);
+    const index = await ctx.fetcher.getText(indexUrl);
+    const children = parseSitemapIndex(index.body).filter(isArticleSitemapUrl);
+    const targets = children.length > 0 ? children : [];
+    if (targets.length === 0) {
+      log.info("no usable article sitemaps; relying on subscriptions for discovery");
+      setMeta(ctx.db, "sitemap_synced_at", new Date().toISOString());
+      return result;
+    }
+
+    for (const target of targets) {
+      log.info(`fetching article sitemap ${target}`);
+      const page = await ctx.fetcher.getText(target);
+      const entries = parseBookSitemap(page.body, base);
+      const apply = ctx.db.transaction(() => {
+        for (const entry of entries) {
+          const outcome = recordSitemapEntry(ctx.db, entry);
+          result.total += 1;
+          if (outcome === "new") result.added += 1;
+          if (outcome === "stale") result.stale += 1;
+        }
+      });
+      apply();
+    }
+  } catch (error) {
+    log.warn(`sitemap sync skipped: ${String(error)}`);
   }
 
   setMeta(ctx.db, "sitemap_synced_at", new Date().toISOString());
@@ -91,14 +114,18 @@ export async function syncSitemap(ctx: AppContext): Promise<SitemapResult> {
   return result;
 }
 
-/** Fetch and store one book detail page. Blog posts share the URL shape and are marked skipped. */
-export async function fetchBookDetail(ctx: AppContext, sourceId: number, url?: string): Promise<"ok" | "skipped"> {
+/** Fetch and store one book detail page. Paid books are recorded as skipped. */
+export async function fetchBookDetail(
+  ctx: AppContext,
+  sourceId: number,
+  url?: string,
+): Promise<"ok" | "skipped"> {
   const row = ctx.db
     .query<{ url: string; slug: string; lastmod: string | null }, [number]>(
       "select url, slug, lastmod from books where source_id = ?",
     )
     .get(sourceId);
-  const target = url ?? row?.url ?? bookUrl(sourceId, row?.slug ?? "", ctx.config.source.baseUrl);
+  const target = url ?? row?.url ?? bookUrl(row?.slug ?? String(sourceId), ctx.config.source.baseUrl);
 
   const page = await ctx.fetcher.getText(target);
   const parsed = parseBookPage(page.body, target, ctx.config.source.baseUrl);
@@ -109,9 +136,8 @@ export async function fetchBookDetail(ctx: AppContext, sourceId: number, url?: s
   }
 
   recordBookDetail(ctx.db, parsed, { lastmod: row?.lastmod ?? null });
+  if (parsed.isPaid) return "skipped";
 
-  // Sibling volumes linked from the description are usually not discoverable any other way
-  // until the sitemap catches up, so register them as pending.
   for (const relatedId of parsed.relatedBookIds) {
     const known = ctx.db
       .query<{ source_id: number }, [number]>("select source_id from books where source_id = ?")
@@ -120,9 +146,9 @@ export async function fetchBookDetail(ctx: AppContext, sourceId: number, url?: s
       ctx.db
         .query(
           `insert into books (source_id, url, slug, title, first_seen_at, detail_state)
-           values (?, ?, '', '', ?, 'pending')`,
+           values (?, ?, ?, '', datetime('now'), 'pending')`,
         )
-        .run(relatedId, bookUrl(relatedId, "", ctx.config.source.baseUrl), new Date().toISOString());
+        .run(relatedId, "", `related-${relatedId}`);
     }
   }
 
@@ -133,109 +159,124 @@ export interface BackfillResult {
   attempted: number;
   ok: number;
   skipped: number;
-  failed: number;
-  stoppedEarly: boolean;
+  errors: number;
 }
 
-/**
- * Slowly fetch detail pages for subscription matches and queued books only.
- * Never walks the whole sitemap catalogue. Stops early if the source pushes back.
- */
 export async function backfillDetails(ctx: AppContext, limit: number): Promise<BackfillResult> {
-  const result: BackfillResult = { attempted: 0, ok: 0, skipped: 0, failed: 0, stoppedEarly: false };
+  const result: BackfillResult = { attempted: 0, ok: 0, skipped: 0, errors: 0 };
   const pending = booksNeedingDetailForSubscriptions(ctx.db, ctx.config.subscriptions, limit);
-
-  if (pending.length === 0) {
-    const pendingAll = ctx.db
-      .query<{ n: number }, []>("select count(*) as n from books where detail_state = 'pending'")
-      .get()?.n ?? 0;
-    log.info(
-      `backfill: nothing pending for subscriptions/queue (catalogue pending=${pendingAll} ignored)`,
-    );
-    setMeta(ctx.db, "backfill_ran_at", new Date().toISOString());
-    return result;
-  }
-
-  log.info(`backfill: fetching ${pending.length} detail page(s)`);
-
   for (const book of pending) {
-    if (ctx.fetcher.limiter.inCooldown() && !ctx.fetcher.flareConfigured) {
-      result.stoppedEarly = true;
-      break;
-    }
     result.attempted += 1;
     try {
-      const outcome = await fetchBookDetail(ctx, book.source_id, book.url);
+      const outcome = await fetchBookDetail(ctx, book.source_id, book.url || undefined);
       if (outcome === "ok") result.ok += 1;
       else result.skipped += 1;
     } catch (error) {
-      result.failed += 1;
-      markBookState(ctx.db, book.source_id, "pending", String(error));
-      if (error instanceof CooldownError) {
-        result.stoppedEarly = true;
-        break;
-      }
-      log.warn(`detail fetch failed for ${book.source_id}: ${String(error)}`);
-      // Three consecutive failures usually means the source is blocking us again.
-      if (result.failed >= 3 && result.ok === 0) {
-        result.stoppedEarly = true;
-        break;
-      }
+      if (error instanceof CooldownError) throw error;
+      markBookState(ctx.db, book.source_id, "error", String(error));
+      result.errors += 1;
+      log.warn(`detail ${book.source_id} failed: ${String(error)}`);
     }
   }
-
-  setMeta(ctx.db, "backfill_ran_at", new Date().toISOString());
-  log.info(
-    `backfill done: ${result.ok} ok, ${result.skipped} skipped, ${result.failed} failed` +
-      (result.stoppedEarly ? " (stopped early)" : ""),
-  );
+  setMeta(ctx.db, "backfill_at", new Date().toISOString());
   return result;
 }
 
+export interface FacetCrawlResult {
+  pages: number;
+  cards: number;
+  free: number;
+  paidSkipped: number;
+}
+
+export type FacetKind = "author" | "performer" | "series" | "genre" | "search";
+
+function facetListingUrl(kind: FacetKind, key: string, page: number, base: string): string {
+  switch (kind) {
+    case "author":
+      return page <= 1 ? authorUrl(key, base) : `${authorUrl(key, base)}page${page}/`;
+    case "performer":
+      return page <= 1 ? performerUrl(key, base) : `${performerUrl(key, base)}page${page}/`;
+    case "series":
+      return page <= 1 ? seriesUrl(key, base) : `${seriesUrl(key, base)}page${page}/`;
+    case "genre":
+      return page <= 1 ? sectionUrl(key, base) : `${sectionUrl(key, base)}page${page}/`;
+    case "search":
+      return searchBooksUrl(key, page, base);
+  }
+}
+
 /**
- * Walk a facet listing (a series, narrator or author page) and register every book on it.
- * One request covers up to ~24 books, which is far cheaper than visiting each detail page,
- * and it is how a subscription discovers volumes the sitemap has not surfaced yet.
- * Books are linked to the facet immediately so the queue can fill without a detail crawl.
+ * Crawl a facet / search listing and register cards.
+ * For `search`, stamps the query string as a tag on every free book.
  */
 export async function crawlFacet(
   ctx: AppContext,
-  kind: "avtor" | "chitaet" | "cikl",
+  kind: FacetKind | "avtor" | "chitaet" | "cikl",
   key: string,
   maxPages = 5,
   displayName?: string,
-): Promise<{ pages: number; cards: number }> {
-  const base = ctx.config.source.baseUrl;
-  const facetKey = key.trim().toLowerCase();
-  let pages = 0;
-  let cards = 0;
-  let lastPage = 1;
+): Promise<FacetCrawlResult> {
+  const normalised: FacetKind =
+    kind === "avtor" ? "author" : kind === "chitaet" ? "performer" : kind === "cikl" ? "series" : kind;
 
-  for (let page = 1; page <= Math.min(maxPages, lastPage); page += 1) {
-    const url = xfsearchUrl(kind, facetKey, page, base);
+  const base = ctx.config.source.baseUrl;
+  const result: FacetCrawlResult = { pages: 0, cards: 0, free: 0, paidSkipped: 0 };
+  const storeKind: ListingFacet["kind"] =
+    normalised === "author" ? "author" : normalised === "performer" ? "performer" : "series";
+
+  for (let page = 1; page <= maxPages; page++) {
+    const url = facetListingUrl(normalised, key, page, base);
+    log.info(`facet ${normalised}/${key} page ${page}: ${url}`);
     const response = await ctx.fetcher.getText(url);
     const listing = parseListingPage(response.body, base);
-    lastPage = Math.max(lastPage, listing.lastPage);
-    pages += 1;
+    result.pages += 1;
 
     const apply = ctx.db.transaction(() => {
       for (const card of listing.cards) {
-        recordListingCard(ctx.db, card, {
-          kind,
-          key: facetKey,
-          name: displayName?.trim() || facetKey,
-        });
-        cards += 1;
+        result.cards += 1;
+        if (card.isPaid && normalised !== "search") {
+          // Soft signal from listing; detail page is authoritative. Still record the card.
+        }
+        if (normalised === "search") {
+          recordListingCard(ctx.db, card);
+          if (card.seriesName) {
+            recordListingCard(ctx.db, card, {
+              kind: "series",
+              key: card.seriesName,
+              name: card.seriesName,
+            });
+          }
+          addBookTag(ctx.db, card.sourceId, key);
+          result.free += 1;
+        } else if (normalised === "genre") {
+          recordListingCard(ctx.db, card);
+          result.free += 1;
+        } else {
+          recordListingCard(ctx.db, card, {
+            kind: storeKind,
+            key,
+            name: displayName ?? key,
+          });
+          result.free += 1;
+        }
+
+        if (card.seriesSequence) {
+          ctx.db
+            .query("update books set series_seq = coalesce(series_seq, ?) where source_id = ?")
+            .run(card.seriesSequence, card.sourceId);
+        }
       }
     });
     apply();
 
+    if (page >= listing.lastPage && !listing.nextUrl) break;
     if (listing.cards.length === 0) break;
   }
 
-  return { pages, cards };
+  return result;
 }
 
-export function lastSitemapSync(ctx: AppContext): string | null {
-  return getMeta(ctx.db, "sitemap_synced_at");
+export function lastSeedAt(ctx: AppContext): string | null {
+  return getMeta(ctx.db, "seeded_at");
 }

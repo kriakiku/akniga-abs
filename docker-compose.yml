@@ -1,20 +1,14 @@
 services:
-  4read-abs:
+  akniga-abs:
     # Published by .github/workflows/container.yml on v* tags.
-    image: ghcr.io/kriakiku/4read-abs:latest
+    image: ghcr.io/kriakiku/akniga-abs:latest
     # Uncomment to build from this checkout instead of pulling GHCR:
     # build: .
     restart: unless-stopped
-    depends_on:
-      - flaresolverr
     ports:
       # No authentication: keep this on the loopback interface.
       - "127.0.0.1:8480:8480"
     environment:
-      FLARESOLVERR_URL: http://flaresolverr:8191/v1
-      # Bun cannot reuse FlareSolverr clearance cookies (TLS fingerprint). "always"
-      # skips doomed direct probes; "auto" also sticks to Flare after the first challenge.
-      FLARESOLVERR_MODE: ${FLARESOLVERR_MODE:-always}
       ABS_URL: ${ABS_URL:-}
       ABS_API_KEY: ${ABS_API_KEY:-}
       ABS_LIBRARY_DIR: /library
@@ -27,17 +21,3 @@ services:
       - ./staging:/staging
       # The same audiobook library Audiobookshelf uses. Must be writable.
       - /srv/audiobooks:/library
-
-  flaresolverr:
-    # Stock FlareSolverr v2 cannot return .m3u / binary bodies (download removed).
-    # flaresolverr-go supports download:true and executeJs (in-page fetch of the playlist).
-    image: rorqualx/flaresolverr-go:latest
-    restart: unless-stopped
-    environment:
-      LOG_LEVEL: warning
-      TZ: Europe/Kyiv
-      # Must stay false: cover/audio downloads open URLs inside this browser.
-      DISABLE_MEDIA: "false"
-    # Only 4read-abs needs to reach it, so no host port is published.
-    expose:
-      - "8191"

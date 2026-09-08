@@ -111,12 +111,14 @@ export function recordSitemapEntry(db: Db, entry: SitemapBookEntry): "new" | "st
   return "unchanged";
 }
 
-/** Which xfsearch facet a listing card was discovered on, if any. */
+/** Which listing facet a card was discovered on, if any. */
 export interface ListingFacet {
-  kind: "avtor" | "chitaet" | "cikl";
+  kind: "author" | "performer" | "series" | "avtor" | "chitaet" | "cikl";
   key: string;
   /** Display name for the entity table; defaults to the key. */
   name?: string;
+  /** Extra tag to attach (e.g. search query). */
+  extraTag?: string;
 }
 
 /**
@@ -175,12 +177,16 @@ export function recordListingCard(db: Db, card: ListingCard, facet?: ListingFace
 
 function attachListingFacet(db: Db, sourceId: number, facet: ListingFacet): void {
   const name = (facet.name ?? facet.key).trim() || facet.key;
-  if (facet.kind === "avtor") {
+  const kind = facet.kind === "avtor" ? "author" : facet.kind === "chitaet" ? "performer" : facet.kind === "cikl" ? "series" : facet.kind;
+  if (facet.extraTag?.trim()) {
+    db.query("insert or ignore into book_tags (source_id, tag) values (?, ?)").run(sourceId, facet.extraTag.trim());
+  }
+  if (kind === "author") {
     upsertAuthor(db, { key: facet.key, name });
     db.query("insert or ignore into book_authors (source_id, author_key) values (?, ?)").run(sourceId, facet.key);
     return;
   }
-  if (facet.kind === "chitaet") {
+  if (kind === "performer") {
     upsertNarrator(db, { key: facet.key, name });
     db.query("insert or ignore into book_narrators (source_id, narrator_key) values (?, ?)").run(sourceId, facet.key);
     return;
@@ -215,51 +221,99 @@ export function recordBookDetail(db: Db, book: ParsedBook, options: { lastmod?: 
   ).toString(16);
 
   const transaction = db.transaction(() => {
-    db.query(
-      `insert into books (
-         source_id, url, slug, title, description, cover_url, duration_sec, rating, votes,
-         series_key, series_name, series_seq, lastmod, first_seen_at, fetched_at, content_hash,
-         work_key, work_label, detail_state, detail_error
-       ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', null)
-       on conflict(source_id) do update set
-         url = excluded.url,
-         slug = excluded.slug,
-         title = excluded.title,
-         description = excluded.description,
-         cover_url = excluded.cover_url,
-         duration_sec = excluded.duration_sec,
-         rating = excluded.rating,
-         votes = excluded.votes,
-         series_key = excluded.series_key,
-         series_name = excluded.series_name,
-         series_seq = excluded.series_seq,
-         lastmod = coalesce(excluded.lastmod, books.lastmod),
-         fetched_at = excluded.fetched_at,
-         content_hash = excluded.content_hash,
-         work_key = excluded.work_key,
-         work_label = excluded.work_label,
-         detail_state = 'ok',
-         detail_error = null`,
-    ).run(
-      book.sourceId,
-      book.url,
-      book.slug,
-      book.title,
-      book.description,
-      book.coverUrl,
-      book.durationSec,
-      book.rating,
-      book.votes,
-      book.series?.key ?? null,
-      book.series?.name ?? null,
-      book.series?.sequence ?? null,
-      options.lastmod ?? null,
-      nowIso(),
-      nowIso(),
-      contentHash,
-      identity.key,
-      identity.label,
-    );
+    if (book.isPaid) {
+      db.query(
+        `insert into books (
+           source_id, url, slug, title, description, cover_url, duration_sec, rating, votes,
+           series_key, series_name, series_seq, lastmod, first_seen_at, fetched_at, content_hash,
+           work_key, work_label, detail_state, detail_error
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', 'paid')
+         on conflict(source_id) do update set
+           url = excluded.url,
+           slug = excluded.slug,
+           title = excluded.title,
+           description = excluded.description,
+           cover_url = excluded.cover_url,
+           duration_sec = excluded.duration_sec,
+           rating = excluded.rating,
+           votes = excluded.votes,
+           series_key = excluded.series_key,
+           series_name = excluded.series_name,
+           series_seq = excluded.series_seq,
+           lastmod = coalesce(excluded.lastmod, books.lastmod),
+           fetched_at = excluded.fetched_at,
+           content_hash = excluded.content_hash,
+           work_key = excluded.work_key,
+           work_label = excluded.work_label,
+           detail_state = 'skipped',
+           detail_error = 'paid'`,
+      ).run(
+        book.sourceId,
+        book.url,
+        book.slug,
+        book.title,
+        book.description,
+        book.coverUrl,
+        book.durationSec,
+        book.rating,
+        book.votes,
+        book.series?.key ?? null,
+        book.series?.name ?? null,
+        book.series?.sequence ?? null,
+        options.lastmod ?? null,
+        nowIso(),
+        nowIso(),
+        contentHash,
+        identity.key,
+        identity.label,
+      );
+    } else {
+      db.query(
+        `insert into books (
+           source_id, url, slug, title, description, cover_url, duration_sec, rating, votes,
+           series_key, series_name, series_seq, lastmod, first_seen_at, fetched_at, content_hash,
+           work_key, work_label, detail_state, detail_error
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', null)
+         on conflict(source_id) do update set
+           url = excluded.url,
+           slug = excluded.slug,
+           title = excluded.title,
+           description = excluded.description,
+           cover_url = excluded.cover_url,
+           duration_sec = excluded.duration_sec,
+           rating = excluded.rating,
+           votes = excluded.votes,
+           series_key = excluded.series_key,
+           series_name = excluded.series_name,
+           series_seq = excluded.series_seq,
+           lastmod = coalesce(excluded.lastmod, books.lastmod),
+           fetched_at = excluded.fetched_at,
+           content_hash = excluded.content_hash,
+           work_key = excluded.work_key,
+           work_label = excluded.work_label,
+           detail_state = 'ok',
+           detail_error = null`,
+      ).run(
+        book.sourceId,
+        book.url,
+        book.slug,
+        book.title,
+        book.description,
+        book.coverUrl,
+        book.durationSec,
+        book.rating,
+        book.votes,
+        book.series?.key ?? null,
+        book.series?.name ?? null,
+        book.series?.sequence ?? null,
+        options.lastmod ?? null,
+        nowIso(),
+        nowIso(),
+        contentHash,
+        identity.key,
+        identity.label,
+      );
+    }
 
     for (const author of book.authors) upsertAuthor(db, author);
     for (const narrator of book.narrators) upsertNarrator(db, narrator);
@@ -269,6 +323,12 @@ export function recordBookDetail(db: Db, book: ParsedBook, options: { lastmod?: 
     db.query("delete from book_authors where source_id = ?").run(book.sourceId);
     db.query("delete from book_narrators where source_id = ?").run(book.sourceId);
     db.query("delete from book_genres where source_id = ?").run(book.sourceId);
+    // Keep previously stamped search tags; only replace label tags from this parse by
+    // re-inserting the union below.
+    const previousTags = db
+      .query<{ tag: string }, [number]>("select tag from book_tags where source_id = ?")
+      .all(book.sourceId)
+      .map((row) => row.tag);
     db.query("delete from book_tags where source_id = ?").run(book.sourceId);
 
     for (const author of book.authors) {
@@ -289,7 +349,8 @@ export function recordBookDetail(db: Db, book: ParsedBook, options: { lastmod?: 
         genre.key,
       );
     }
-    for (const tag of book.tags) {
+    const allTags = new Set([...previousTags, ...book.tags]);
+    for (const tag of allTags) {
       db.query("insert or ignore into book_tags (source_id, tag) values (?, ?)").run(book.sourceId, tag);
     }
   });
@@ -370,33 +431,55 @@ export function booksNeedingDetailForSubscriptions(
     .all(...ids, limit);
 }
 
-const SUBSCRIPTION_QUERIES: Record<string, string> = {
-  author: `select b.* from books b
-           join book_authors ba on ba.source_id = b.source_id
-           join authors a on a.key = ba.author_key
-           where ba.author_key = ?1 or lower(a.name) = ?1`,
-  narrator: `select b.* from books b
-             join book_narrators bn on bn.source_id = b.source_id
-             join narrators n on n.key = bn.narrator_key
-             where bn.narrator_key = ?1 or lower(n.name) = ?1`,
+const SUBSCRIPTION_LOADERS: Record<string, string> = {
   series: `select b.* from books b
-           left join series s on s.key = b.series_key
-           where b.series_key = ?1 or lower(s.name) = ?1`,
+           where b.series_key is not null and b.series_key != ''`,
   genre: `select b.* from books b
-          join book_genres bg on bg.source_id = b.source_id
-          join genres g on g.key = bg.genre_key
-          where bg.genre_key = ?1 or lower(g.name) = ?1`,
+          join book_genres bg on bg.source_id = b.source_id`,
   tag: `select b.* from books b
-        join book_tags bt on bt.source_id = b.source_id
-        where lower(bt.tag) = ?1`,
+        join book_tags bt on bt.source_id = b.source_id`,
+  search: `select b.* from books b
+           join book_tags bt on bt.source_id = b.source_id`,
+  author: `select b.* from books b
+           join book_authors ba on ba.source_id = b.source_id`,
+  narrator: `select b.* from books b
+             join book_narrators bn on bn.source_id = b.source_id`,
 };
 
+/** Attach an extra tag (e.g. search query) without wiping existing tags. */
+export function addBookTag(db: Db, sourceId: number, tag: string): void {
+  const cleaned = tag.trim();
+  if (!cleaned) return;
+  db.query("insert or ignore into book_tags (source_id, tag) values (?, ?)").run(sourceId, cleaned);
+}
+
+/**
+ * Match subscriptions in JS so Cyrillic lowercasing works (SQLite `lower()` is ASCII-only).
+ */
 export function booksForSubscription(db: Db, type: string, value: string): BookWithPeople[] {
-  const sql = SUBSCRIPTION_QUERIES[type];
+  const sql = SUBSCRIPTION_LOADERS[type];
   if (!sql) return [];
   const needle = value.trim().toLowerCase();
-  const rows = db.query<BookRow, [string]>(sql).all(needle);
-  return rows.map((row) => withPeople(db, row));
+  const rows = db.query<BookRow, []>(sql).all();
+  const seen = new Set<number>();
+  const matched: BookWithPeople[] = [];
+  for (const row of rows) {
+    if (seen.has(row.source_id)) continue;
+    const book = withPeople(db, row);
+    const haystacks: string[] = [];
+    if (type === "author") haystacks.push(...book.authors);
+    else if (type === "narrator") haystacks.push(...book.narrators);
+    else if (type === "series") {
+      if (book.series_key) haystacks.push(book.series_key);
+      if (book.series_name) haystacks.push(book.series_name);
+    } else if (type === "genre") haystacks.push(...book.genres);
+    else if (type === "tag" || type === "search") haystacks.push(...book.tags);
+    if (haystacks.some((h) => h.trim().toLowerCase() === needle)) {
+      seen.add(row.source_id);
+      matched.push(book);
+    }
+  }
+  return matched;
 }
 
 export interface CatalogCounts {

@@ -154,7 +154,7 @@ function ensureColumn(db: Database, table: string, column: string, ddl: string):
 export function openDb(dataDir: string): Db {
   const dir = resolve(dataDir);
   mkdirSync(dir, { recursive: true });
-  const db = new Database(join(dir, "4read-abs.db"), { create: true });
+  const db = new Database(join(dir, "akniga-abs.db"), { create: true });
   db.run("pragma journal_mode = WAL");
   db.run("pragma foreign_keys = ON");
   db.run("pragma busy_timeout = 5000");

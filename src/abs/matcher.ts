@@ -93,7 +93,7 @@ export interface MatchOutcome {
   candidates: MatchCandidate[];
 }
 
-/** `4read:6840` embedded in the item's tags is an exact identifier we wrote ourselves. */
+/** `akniga:6840` (tagPrefix:sourceId) embedded in the item's tags is an exact identifier we wrote ourselves. */
 function sourceIdFromTags(item: AbsItem, config: Config): number | null {
   const prefix = `${config.sync.tagPrefix}:`.toLowerCase();
   for (const tag of item.tags) {

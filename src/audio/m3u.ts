@@ -1,22 +1,22 @@
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, join } from "node:path";
 import type { Config } from "../config.ts";
 import type { BookWithPeople } from "../catalog/store.ts";
 import type { Fetcher } from "../fetch/fetcher.ts";
 import { isMediaFile } from "../abs/stage.ts";
-import { parseBookUrl, bookUrl } from "../source/urls.ts";
 import { logger } from "../log.ts";
+import {
+  chaptersForBook,
+  fetchPlayerBookData,
+  resolveMediaUrl,
+  type PlayerChapter,
+} from "../source/player.ts";
 
 const log = logger("audio");
 
-const PLAYLIST_MARKER = ".4read-audio-playlist";
-/** Expected track list for UI + partial resume (written as soon as the m3u is parsed). */
-const TRACKS_MANIFEST = ".4read-audio-tracks.json";
-
-export interface PlaylistTrack {
-  url: string;
-  title: string | null;
-}
+const AUDIO_MARKER = ".akniga-audio-done";
+const TRACKS_MANIFEST = ".akniga-audio-tracks.json";
+const CHAPTERS_FILE = "chapters.json";
 
 export interface AudioFetchResult {
   playlistUrl: string;
@@ -28,11 +28,8 @@ export interface AudioFetchResult {
 
 export type AudioTrackStatus = "downloaded" | "pending";
 
-/** One expected track for the queue UI / resume logic. */
 export interface AudioTrackInfo {
-  /** Source path without domain or query, e.g. `2901/01.mp3`. */
   name: string;
-  /** Local staging filename, e.g. `0001-01.mp3`. */
   file: string;
   status: AudioTrackStatus;
 }
@@ -45,76 +42,66 @@ export interface AudioStatus {
 }
 
 interface TracksManifest {
-  playlistUrl: string;
-  tracks: Array<{ file: string; name: string }>;
+  mediaUrl: string;
+  kind: "hls" | "mp3";
+  output: string;
+  chapters: Array<{ title: string; startSec: number; endSec: number }>;
 }
 
-/** Playlist path segment: `{id}-{slug}` matching the article basename without `.html`. */
-const PLAYLIST_KEY_RE = /^\d+-[a-zA-Z0-9][\w.-]{0,180}$/;
+export async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await worker(items[index]!, index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
 
-/**
- * Source path for display / resume identity: no domain, no query/hash.
- * `https://reasd.org/2901/01.mp3?expires=1&md5=x` → `2901/01.mp3`
- */
-export function trackSourcePath(url: string): string {
+async function fileLooksComplete(path: string, minFileBytes: number): Promise<boolean> {
   try {
-    const parsed = new URL(url);
-    return decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
+    const info = await stat(path);
+    return info.isFile() && info.size >= minFileBytes;
   } catch {
-    const noQuery = url.split(/[?#]/)[0] ?? url;
-    return noQuery.replace(/^https?:\/\/[^/]+\//i, "").replace(/^\/+/, "");
+    return false;
   }
-}
-
-async function writeTracksManifest(
-  dir: string,
-  playlistUrl: string,
-  tracks: PlaylistTrack[],
-): Promise<void> {
-  const payload: TracksManifest = {
-    playlistUrl,
-    tracks: tracks.map((track, index) => ({
-      file: trackFileName(index, track),
-      name: trackSourcePath(track.url),
-    })),
-  };
-  await writeFile(join(dir, TRACKS_MANIFEST), `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 async function readTracksManifest(dir: string): Promise<TracksManifest | null> {
   try {
     const raw = await readFile(join(dir, TRACKS_MANIFEST), "utf8");
-    const parsed = JSON.parse(raw) as TracksManifest;
-    if (!parsed || !Array.isArray(parsed.tracks)) return null;
-    return parsed;
+    return JSON.parse(raw) as TracksManifest;
   } catch {
     return null;
   }
 }
 
-/** Status of expected / present audio files in a staging folder (for the queue UI). */
 export async function readAudioStatus(dir: string, minFileBytes: number): Promise<AudioStatus> {
   const manifest = await readTracksManifest(dir);
-  if (manifest?.tracks.length) {
-    const files: AudioTrackInfo[] = [];
-    for (const track of manifest.tracks) {
-      const done = await fileLooksComplete(join(dir, track.file), minFileBytes);
-      files.push({
-        name: track.name || track.file,
-        file: track.file,
+  if (manifest?.output) {
+    const done = await fileLooksComplete(join(dir, manifest.output), minFileBytes);
+    const files: AudioTrackInfo[] = [
+      {
+        name: manifest.output,
+        file: manifest.output,
         status: done ? "downloaded" : "pending",
-      });
-    }
-    const downloaded = files.filter((f) => f.status === "downloaded").length;
+      },
+    ];
     return {
       files,
-      downloaded,
-      total: files.length,
-      complete: downloaded === files.length && files.length > 0,
+      downloaded: done ? 1 : 0,
+      total: 1,
+      complete: done,
     };
   }
 
-  // Legacy folder: no manifest yet — list whatever media is on disk as downloaded.
   const files: AudioTrackInfo[] = [];
   try {
     for (const name of await readdir(dir)) {
@@ -123,7 +110,7 @@ export async function readAudioStatus(dir: string, minFileBytes: number): Promis
       files.push({ name, file: name, status: "downloaded" });
     }
   } catch {
-    // Missing dir.
+    // missing dir
   }
   files.sort((a, b) => a.file.localeCompare(b.file));
   return {
@@ -134,549 +121,349 @@ export async function readAudioStatus(dir: string, minFileBytes: number): Promis
   };
 }
 
-/**
- * 4read playlist id is the article path without `.html`:
- * `https://4read.org/5546-garri-garrison-….html` → `5546-garri-garrison-…`
- * (not the slug alone). Prefer the book URL; fall back to `source_id` + slug.
- */
-export function playlistKeyFor(book: {
-  source_id?: number;
-  slug: string;
-  url?: string | null;
-}): string | null {
-  const fromUrl = book.url ? parseBookUrl(book.url) : null;
-  const candidates: string[] = [];
-  if (fromUrl?.slug) candidates.push(`${fromUrl.sourceId}-${fromUrl.slug}`);
-  if (book.source_id && book.slug) candidates.push(`${book.source_id}-${book.slug}`);
-  // Already a full key in slug field (legacy / manual).
-  if (book.slug && /^\d+-/.test(book.slug)) candidates.push(book.slug);
-
-  for (const candidate of candidates) {
-    let decoded = candidate;
-    try {
-      decoded = decodeURIComponent(candidate);
-    } catch {
-      // keep raw
-    }
-    if (/[<>]/.test(decoded) || /<html/i.test(decoded)) continue;
-    if (PLAYLIST_KEY_RE.test(candidate)) return candidate;
-    if (PLAYLIST_KEY_RE.test(decoded)) return decoded;
-  }
-  return null;
-}
-
-/** @deprecated Use playlistKeyFor */
-export function playlistSlugFor(book: {
-  source_id?: number;
-  slug: string;
-  url?: string | null;
-}): string | null {
-  return playlistKeyFor(book);
-}
-
-export function playlistUrlFor(
-  book: { source_id?: number; slug: string; url?: string | null },
-  config: Config,
-): string | null {
-  const key = playlistKeyFor(book);
-  if (!key) return null;
-  const base = config.source.baseUrl.replace(/\/+$/, "");
-  return `${base}/m33u2/${encodeURIComponent(key)}.m3u`;
-}
-
-/** True when a playlist GET clearly returned a web page instead of M3U. */
-export function looksLikeHtmlDocument(raw: string): boolean {
-  const head = raw.trim().slice(0, 256).toLowerCase();
-  return (
-    head.startsWith("<!doctype") ||
-    head.startsWith("<html") ||
-    head.includes("<head") ||
-    head.includes("just a moment") ||
-    head.includes("_cf_chl")
-  );
-}
-
-/**
- * Parse an M3U / M3U8 body into ordered track URLs. Supports `#EXTINF` titles and bare URL lists.
- * Rejects HTML scraps — Cloudflare challenge pages must not become relative "track" URLs.
- */
-export function parseM3u(body: string, baseUrl?: string): PlaylistTrack[] {
-  const tracks: PlaylistTrack[] = [];
-  let pendingTitle: string | null = null;
-
-  for (const rawLine of body.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (line.startsWith("#EXTM3U") || line.startsWith("#EXT-X-")) continue;
-    if (line.startsWith("#EXTINF:")) {
-      const comma = line.indexOf(",");
-      pendingTitle = comma >= 0 ? line.slice(comma + 1).trim() || null : null;
-      continue;
-    }
-    if (line.startsWith("#")) continue;
-    // HTML tags / challenge pages must never resolve against the playlist base URL.
-    if (/[<>]/.test(line) || /\s/.test(line)) continue;
-    if (!isPlausibleTrackRef(line)) continue;
-
-    let url = line;
-    if (baseUrl && !/^https?:\/\//i.test(url)) {
-      try {
-        url = new URL(url, baseUrl).href;
-      } catch {
-        continue;
-      }
-    }
-    if (!isPlausibleTrackUrl(url)) continue;
-    tracks.push({ url, title: pendingTitle });
-    pendingTitle = null;
-  }
-
-  return tracks;
-}
-
-function isPlausibleTrackRef(line: string): boolean {
-  if (/^https?:\/\//i.test(line)) return true;
-  // Relative media: `files/1.mp3`, `a.mp3`, `../audio/b.m4b`
-  if (!/^[\w./%-]+$/i.test(line)) return false;
-  return line.includes("/") || /\.(mp3|m4a|m4b|flac|ogg|opus)(\?.*)?$/i.test(line);
-}
-
-function isPlausibleTrackUrl(url: string): boolean {
-  if (!/^https?:\/\//i.test(url)) return false;
-  try {
-    const path = decodeURIComponent(new URL(url).pathname);
-    if (/[<>]/.test(path) || /<html/i.test(path)) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function originalNameFromUrl(url: string): { stem: string; extension: string } {
-  try {
-    // Query/hash must not leak into the local filename — only the path basename matters.
-    const path = new URL(url).pathname;
-    const base = basename(decodeURIComponent(path));
-    const extension = extname(base).toLowerCase();
-    const stem = safeStem(base.slice(0, base.length - extension.length));
-    const allowed = [".mp3", ".m4a", ".m4b", ".flac", ".ogg", ".opus"];
-    return {
-      stem,
-      extension: allowed.includes(extension) ? extension : ".mp3",
-    };
-  } catch {
-    return { stem: "", extension: ".mp3" };
-  }
-}
-
-/** Local name: `0001-origName.mp3` (fixed 4-digit index; query params stripped from origName). */
-export function trackFileName(index: number, track: PlaylistTrack): string {
-  const prefix = String(index + 1).padStart(4, "0");
-  const fromUrl = originalNameFromUrl(track.url);
-  const stem = fromUrl.stem || (track.title ? safeStem(track.title) : "") || `track-${prefix}`;
-  return `${prefix}-${stem}${fromUrl.extension}`;
-}
-
-function safeStem(value: string): string {
-  return value
-    .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^[.\s]+|[.\s]+$/g, "")
-    .trim()
-    .slice(0, 80);
-}
-
-/**
- * FlareSolverr returns page HTML for text GETs; peel a bare M3U out of a wrapper if needed.
- * Returns an empty string when the body is an HTML document with no embedded playlist —
- * otherwise `<html…>` would be parsed as a relative track path under `/m33u2/`.
- */
-export function extractPlaylistBody(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) return "";
-  if (trimmed.startsWith("#EXTM3U")) return trimmed;
-  // Bare URL-only playlist (no EXTINF header) — only when the whole body is the list.
-  if (/^https?:\/\//i.test(trimmed) && !/[<>]/.test(trimmed)) return trimmed;
-
-  const pre = trimmed.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
-  if (pre?.[1]) return pre[1].trim();
-  const start = trimmed.indexOf("#EXTM3U");
-  if (start >= 0) return trimmed.slice(start);
-
-  if (looksLikeHtmlDocument(trimmed)) return "";
-  return trimmed;
-}
-
-async function writeAtomic(path: string, data: Uint8Array): Promise<void> {
-  const temporary = `${path}.tmp-${process.pid}`;
-  await writeFile(temporary, data);
-  await rename(temporary, path);
-}
-
-async function fileLooksComplete(path: string, minBytes: number): Promise<boolean> {
-  try {
-    const info = await stat(path);
-    return info.isFile() && info.size >= minBytes;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Drop playlist marker and media files so the next accept/download re-fetches audio.
- * Leaves metadata.json / cover.* alone.
- */
 export async function clearDownloadedAudio(dir: string): Promise<number> {
   let removed = 0;
   try {
-    await rm(join(dir, PLAYLIST_MARKER), { force: true });
-  } catch {
-    // ignore
-  }
-  try {
-    await rm(join(dir, TRACKS_MANIFEST), { force: true });
-  } catch {
-    // ignore
-  }
-  try {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
-      if (!entry.isFile() || !isMediaFile(entry.name)) continue;
-      await rm(join(dir, entry.name), { force: true });
-      removed += 1;
+    for (const name of await readdir(dir)) {
+      if (name.startsWith(".")) {
+        if (name === AUDIO_MARKER || name === TRACKS_MANIFEST || name.startsWith(".tmp-")) {
+          await rm(join(dir, name), { force: true });
+        }
+        continue;
+      }
+      if (isMediaFile(name) || name === CHAPTERS_FILE || name === "ffmetadata.txt") {
+        await rm(join(dir, name), { force: true });
+        if (isMediaFile(name)) removed += 1;
+      }
     }
+    await rm(join(dir, "hls"), { recursive: true, force: true });
   } catch {
-    // Missing folder is fine.
+    // ignore
   }
-  if (removed > 0) log.info(`cleared ${removed} audio file(s) from ${dir}`);
   return removed;
 }
 
-/**
- * Wipe a book working folder (audio, cover, metadata, marker) so Delete → re-Accept
- * starts clean — including the UI cover preview cache.
- */
 export async function clearBookFolder(dir: string): Promise<{ audio: number; wiped: boolean }> {
-  const audio = await clearDownloadedAudio(dir);
+  let audio = 0;
   try {
-    await rm(dir, { recursive: true, force: true });
-    log.info(`wiped book folder ${dir}`);
-    return { audio, wiped: true };
-  } catch {
-    return { audio, wiped: false };
-  }
-}
-
-/**
- * Article page used as Referer when fetching `/m33u2/{id}-{slug}.m3u`.
- * Always on `source.baseUrl`, e.g. `https://4read.org/5546-garri-garrison-….html`.
- */
-export function bookPageReferer(
-  book: { source_id: number; slug: string; url?: string | null },
-  config: Config,
-): string {
-  const base = config.source.baseUrl.replace(/\/+$/, "");
-  const key = playlistKeyFor(book);
-  if (key) return `${base}/${key}.html`;
-  return bookUrl(book.source_id, book.slug, base);
-}
-
-/** Pathname of a playlist URL, lowercased and decoded when possible. */
-function playlistPath(url: string): string {
-  try {
-    return decodeURIComponent(new URL(url).pathname).toLowerCase();
-  } catch {
-    return url.toLowerCase();
-  }
-}
-
-/**
- * Pull the player playlist URL from book HTML, e.g.
- * `new Playerjs({file:"https://4read.org/m33u2/5546-….m3u"})`.
- *
- * Page slug and m3u slug can differ (e.g. `4383-garris-tomas-….html` vs
- * `m33u2/4383-tomas-garris-….m3u`). When `preferKey` is set (`{id}-{pageSlug}`),
- * prefer an exact path match, otherwise any `/m33u2/{id}-….m3u` for that id —
- * never a related book's different id.
- */
-export function extractPlaylistUrlFromHtml(
-  html: string,
-  baseUrl?: string,
-  preferKey?: string | null,
-): string | null {
-  const base = baseUrl ?? "https://4read.org/";
-  const patterns = [
-    /Playerjs\(\s*\{[^}]*\bfile\s*:\s*["']([^"']*m33u2[^"']+\.m3u[^"']*)["']/gi,
-    /["'](https?:\/\/[^"']*\/m33u2\/[^"']+\.m3u[^"']*)["']/gi,
-    /["'](\/m33u2\/[^"']+\.m3u[^"']*)["']/gi,
-    // Bare path as on some pages / CDN dumps: m33u2/4383-tomas-garris-….m3u
-    /(?:^|[^/\w])(m33u2\/\d+-[A-Za-z0-9_-]+\.m3u)(?=$|[^A-Za-z0-9_.-])/gi,
-  ];
-  const found: string[] = [];
-  for (const pattern of patterns) {
-    pattern.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(html)) !== null) {
-      const raw = match[1]?.trim();
-      if (!raw) continue;
-      try {
-        const href = new URL(raw.startsWith("m33u2/") ? `/${raw}` : raw, base).href;
-        if (!found.includes(href)) found.push(href);
-      } catch {
-        // skip
-      }
+    for (const name of await readdir(dir)) {
+      if (isMediaFile(name)) audio += 1;
     }
-    if (found.length) break; // Prefer Playerjs matches over loose URL scans.
+  } catch {
+    return { audio: 0, wiped: false };
   }
-  if (found.length === 0) return null;
-  if (!preferKey) return found[0] ?? null;
-
-  const needle = preferKey.toLowerCase();
-  const sourceId = /^(\d+)(?:-|$)/.exec(preferKey)?.[1] ?? null;
-
-  const exact = found.find((url) => playlistPath(url).includes(`/m33u2/${needle}.m3u`));
-  if (exact) return exact;
-
-  // Same article id, different slug order (author surname/forename swapped, etc.).
-  if (sourceId) {
-    const byId = found.find((url) => {
-      const path = playlistPath(url);
-      return new RegExp(`/m33u2/${sourceId}-[^/]+\\.m3u$`, "i").test(path);
-    });
-    if (byId) return byId;
-  }
-
-  // Only related-book embeds with other ids — fall back to constructed URL.
-  return null;
+  await rm(dir, { recursive: true, force: true });
+  return { audio, wiped: true };
 }
 
-interface HarLike {
-  log?: {
-    entries?: Array<{
-      request?: { url?: string };
-      response?: {
-        content?: { text?: string; encoding?: string; mimeType?: string };
-        status?: number;
-      };
-    }>;
-  };
+/** Parse an HLS media playlist into ordered segment URLs (and optional key URL). */
+export function parseHlsSegments(body: string, baseUrl: string): { segments: string[]; keyUrl: string | null } {
+  const segments: string[] = [];
+  let keyUrl: string | null = null;
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#EXT-X-KEY:")) {
+      const uri = /URI="([^"]+)"/.exec(line)?.[1];
+      if (uri) {
+        try {
+          keyUrl = new URL(uri, baseUrl).toString();
+        } catch {
+          keyUrl = uri;
+        }
+      }
+      continue;
+    }
+    if (line.startsWith("#")) continue;
+    try {
+      segments.push(new URL(line, baseUrl).toString());
+    } catch {
+      // skip
+    }
+  }
+  return { segments, keyUrl };
 }
 
-/**
- * If Chrome recorded a HAR while loading the book page, reuse the m33u2 response body
- * (and URL) from that network traffic instead of issuing a second playlist GET.
- */
-export function extractPlaylistFromHar(
-  har: unknown,
-): { url: string; body: string } | null {
-  const entries = (har as HarLike | null)?.log?.entries;
-  if (!Array.isArray(entries)) return null;
-
-  for (const entry of entries) {
-    const url = entry.request?.url ?? "";
-    if (!/\/m33u2\/.+\.m3u(\?|$)/i.test(url)) continue;
-    const content = entry.response?.content;
-    let text = content?.text ?? "";
-    if (!text) continue;
-    if (content?.encoding === "base64") {
+/** If the body is a master playlist, pick the first media playlist URL. */
+export function resolveMediaPlaylist(body: string, baseUrl: string): { body: string; url: string } | { redirect: string } {
+  if (body.includes("#EXT-X-STREAM-INF")) {
+    for (const rawLine of body.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
       try {
-        text = Buffer.from(text, "base64").toString("utf8");
+        return { redirect: new URL(line, baseUrl).toString() };
       } catch {
         continue;
       }
     }
-    const body = extractPlaylistBody(text);
-    if (body) return { url, body };
   }
-  return null;
+  return { body, url: baseUrl };
+}
+
+export function buildFfmetadata(chapters: PlayerChapter[], title: string): string {
+  const lines = [";FFMETADATA1", `title=${escapeMeta(title)}`];
+  for (let i = 0; i < chapters.length; i++) {
+    const chapter = chapters[i]!;
+    const start = Math.max(0, Math.round(chapter.timeFromStart * 1000));
+    const endCandidate = chapter.time > chapter.timeFromStart ? chapter.time : chapter.timeFromStart + chapter.duration;
+    const end = Math.max(start + 1, Math.round(endCandidate * 1000));
+    lines.push("[CHAPTER]", "TIMEBASE=1/1000", `START=${start}`, `END=${end}`, `title=${escapeMeta(chapter.title)}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function escapeMeta(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/=/g, "\\=").replace(/;/g, "\\;").replace(/#/g, "\\#").replace(/\n/g, " ");
+}
+
+async function runFfmpeg(args: string[]): Promise<void> {
+  const proc = Bun.spawn(["ffmpeg", "-y", ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (exitCode !== 0) {
+    throw new Error(`ffmpeg failed (${exitCode}): ${stderr.slice(-800)}`);
+  }
 }
 
 /**
- * Book → site homepage → m3u (executeJs) → tracks (download with homepage Referer).
- * Entire pipeline is exclusive so concurrent Accept jobs cannot switch Chrome mid-book.
+ * Download HLS (.ts) or single mp3 for a book and remux into one `.m4b` with chapter names.
+ * Export name kept as `ensureAudioFromPlaylist` for call-site compatibility.
  */
 export async function ensureAudioFromPlaylist(
   book: BookWithPeople,
   dir: string,
   config: Config,
   fetcher: Fetcher,
-): Promise<AudioFetchResult | null> {
-  return fetcher.runExclusiveAudio(() => ensureAudioFromPlaylistUnlocked(book, dir, config, fetcher));
+): Promise<AudioFetchResult> {
+  await mkdir(dir, { recursive: true });
+  const existing = await readAudioStatus(dir, config.audio.minFileBytes);
+  if (existing.complete) {
+    return {
+      playlistUrl: "",
+      tracks: existing.total,
+      downloaded: existing.downloaded,
+      skipped: existing.downloaded,
+      files: existing.files.map((f) => f.file),
+    };
+  }
+
+  return fetcher.runExclusiveAudio(async () => {
+    const referer = book.url || `${config.source.baseUrl}/`;
+    const player = await fetchPlayerBookData(fetcher, book.source_id, referer, { hls: true });
+    if (player.isPaidPreview) {
+      throw new Error(`book ${book.source_id} is paid (preview only)`);
+    }
+    const media = resolveMediaUrl(player);
+    if (!media) throw new Error(`no playable media for book ${book.source_id}`);
+
+    const chapters = chaptersForBook(player);
+    const outputName = `${String(book.source_id).padStart(4, "0")}-${safeSlug(book.slug || book.title)}.m4b`;
+    const outputPath = join(dir, outputName);
+
+    const manifest: TracksManifest = {
+      mediaUrl: media.url,
+      kind: media.kind,
+      output: outputName,
+      chapters: chapters.map((ch) => ({
+        title: ch.title,
+        startSec: ch.timeFromStart,
+        endSec: ch.time > ch.timeFromStart ? ch.time : ch.timeFromStart + ch.duration,
+      })),
+    };
+    await writeFile(join(dir, TRACKS_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`);
+    await writeFile(join(dir, CHAPTERS_FILE), `${JSON.stringify(manifest.chapters, null, 2)}\n`);
+
+    if (media.kind === "mp3") {
+      const binary = await fetcher.getBinary(media.url, {
+        referer,
+        timeoutMs: config.audio.trackTimeoutMs,
+        accept: "*/*",
+      });
+      const mp3Path = join(dir, ".tmp-source.mp3");
+      await writeFile(mp3Path, binary.bytes);
+      await remuxWithChapters(mp3Path, outputPath, chapters, book.title);
+      await rm(mp3Path, { force: true });
+    } else {
+      await downloadHlsAndRemux(media.url, dir, outputPath, chapters, book.title, config, fetcher, referer);
+    }
+
+    await writeFile(join(dir, AUDIO_MARKER), `${new Date().toISOString()}\n`);
+    return {
+      playlistUrl: media.url,
+      tracks: 1,
+      downloaded: 1,
+      skipped: 0,
+      files: [outputName],
+    };
+  });
 }
 
-async function ensureAudioFromPlaylistUnlocked(
-  book: BookWithPeople,
+async function downloadHlsAndRemux(
+  playlistUrl: string,
   dir: string,
+  outputPath: string,
+  chapters: PlayerChapter[],
+  title: string,
   config: Config,
   fetcher: Fetcher,
-): Promise<AudioFetchResult | null> {
-  const constructedUrl = playlistUrlFor(book, config);
-  const referer = bookPageReferer(book, config);
+  referer: string,
+): Promise<void> {
+  const hlsDir = join(dir, "hls");
+  await mkdir(hlsDir, { recursive: true });
 
-  const markerPath = join(dir, PLAYLIST_MARKER);
-
-  // Resume: if every expected track from a prior manifest is already on disk, skip network.
-  // Marker may be the Playerjs URL (slug ≠ page slug); do not require it to equal constructedUrl.
-  {
-    const prior = await readAudioStatus(dir, config.audio.minFileBytes);
-    if (prior.complete && prior.total > 0) {
-      let storedPlaylist = constructedUrl ?? "";
-      try {
-        storedPlaylist = (await readFile(markerPath, "utf8")).trim() || storedPlaylist;
-      } catch {
-        // no marker yet — still trust a complete tracks manifest
-      }
-      log.debug(
-        `audio already complete for ${book.source_id} (${prior.downloaded}/${prior.total} files)`,
-      );
-      return {
-        playlistUrl: storedPlaylist,
-        tracks: prior.total,
-        downloaded: 0,
-        skipped: prior.downloaded,
-        files: prior.files.map((f) => join(dir, f.file)),
-      };
-    }
+  let currentUrl = playlistUrl;
+  let playlistBody = (
+    await fetcher.getText(currentUrl, { referer, timeoutMs: config.audio.playlistTimeoutMs })
+  ).body;
+  const resolved = resolveMediaPlaylist(playlistBody, currentUrl);
+  if ("redirect" in resolved) {
+    currentUrl = resolved.redirect;
+    playlistBody = (await fetcher.getText(currentUrl, { referer, timeoutMs: config.audio.playlistTimeoutMs })).body;
   }
 
-  log.info(`audio: book→home pipeline for ${book.source_id} → book=${referer}`);
+  const { segments, keyUrl } = parseHlsSegments(playlistBody, currentUrl);
+  if (segments.length === 0) throw new Error(`HLS playlist has no segments: ${currentUrl}`);
 
-  let playlistUrl = constructedUrl;
-  let body: string | null = null;
-  let discovery: "executejs" | "playerjs" | "constructed" | null = constructedUrl
-    ? "constructed"
-    : null;
-
-  const bookPage = await fetcher.establishBookHomeContext(referer);
-  if (bookPage?.body) {
-    const preferKey = playlistKeyFor(book);
-    const fromHtml = extractPlaylistUrlFromHtml(bookPage.body, config.source.baseUrl, preferKey);
-    if (fromHtml) {
-      playlistUrl = fromHtml;
-      discovery = "playerjs";
-      log.info(
-        `audio: m3u URL from Playerjs in book HTML for ${book.source_id} → m3u=${playlistUrl}`,
-      );
-    }
+  if (keyUrl) {
+    const key = await fetcher.getBinary(keyUrl, { referer, timeoutMs: config.audio.trackTimeoutMs });
+    await writeFile(join(hlsDir, "enc.key"), key.bytes);
   }
 
-  if (!playlistUrl) {
-    log.warn(`audio skipped for ${book.source_id}: cannot resolve playlist URL page=${referer}`);
-    return null;
-  }
-
-  // Fresh signed track URLs from the homepage (no Playerjs).
-  body = await fetcher.fetchPlaylistFromHome(playlistUrl);
-  if (body) {
-    discovery = "executejs";
-    log.info(
-      `audio: m3u source=executejs (homepage) for ${book.source_id} → m3u=${playlistUrl}`,
-    );
-  }
-
-  if (!body) {
-    try {
-      log.info(
-        `audio: homepage m3u miss; fallback download/direct for ${book.source_id} → m3u=${playlistUrl}`,
-      );
-      const text = await fetcher.getPlaylistText(playlistUrl, { referer: fetcher.homeUrl() });
-      body = extractPlaylistBody(text.body);
-    } catch (error) {
-      log.warn(
-        `playlist fetch failed for ${book.slug} m3u=${playlistUrl}: ${String(error)}`,
-      );
-      return null;
-    }
-  }
-
-  if (!body) {
-    log.warn(
-      `playlist for ${book.slug} returned HTML/empty instead of M3U (source=${discovery ?? "unknown"}) m3u=${playlistUrl} — Cloudflare or wrong URL?`,
-    );
-    return null;
-  }
-
-  const tracks = parseM3u(body, playlistUrl);
-  if (tracks.length === 0) {
-    log.warn(`playlist empty for ${book.slug} m3u=${playlistUrl}`);
-    return null;
-  }
-
-  await mkdir(dir, { recursive: true });
-  await writeTracksManifest(dir, playlistUrl, tracks);
-
-  const concurrency = Math.max(1, config.audio.trackConcurrency);
-  log.info(
-    `audio: downloading up to ${concurrency} CDN track(s) in parallel for ${book.source_id} (${tracks.length} total)`,
-  );
-
-  const outcomes = await mapPool(tracks, concurrency, async (track, index) => {
-    const name = trackFileName(index, track);
-    const path = join(dir, name);
-    if (await fileLooksComplete(path, config.audio.minFileBytes)) {
-      log.debug(`skip existing ${name} for ${book.source_id}`);
-      return { kind: "skipped" as const, path };
-    }
-    try {
-      // getBinary: Bun GET with homepage Referer (CDN is nginx hotlink, not CF).
-      const binary = await fetcher.getBinary(track.url, {
-        referer: fetcher.homeUrl(),
-        purpose: "media",
-      });
-      if (binary.bytes.length < config.audio.minFileBytes) {
-        log.warn(`track too small (${binary.bytes.length}B) for ${track.url}`);
-        return { kind: "failed" as const };
-      }
-      await writeAtomic(path, binary.bytes);
-      log.debug(`downloaded ${name} for ${book.source_id}`);
-      return { kind: "downloaded" as const, path };
-    } catch (error) {
-      log.warn(`track download failed (${track.url}): ${String(error)}`);
-      return { kind: "failed" as const };
-    }
+  // Rewrite playlist to local segment names for ffmpeg.
+  const localNames: string[] = [];
+  await mapPool(segments, config.audio.trackConcurrency, async (url, index) => {
+    const name = `seg-${String(index).padStart(5, "0")}.ts`;
+    localNames[index] = name;
+    const dest = join(hlsDir, name);
+    if (await fileLooksComplete(dest, config.audio.minFileBytes)) return;
+    const binary = await fetcher.getBinary(url, {
+      referer,
+      timeoutMs: config.audio.trackTimeoutMs,
+      accept: "*/*",
+    });
+    const tmp = join(hlsDir, `.tmp-${name}`);
+    await writeFile(tmp, binary.bytes);
+    await rename(tmp, dest);
   });
 
-  const files: string[] = [];
-  let downloaded = 0;
-  let skipped = 0;
-  for (const outcome of outcomes) {
-    if (outcome.kind === "downloaded") {
-      downloaded += 1;
-      files.push(outcome.path);
-    } else if (outcome.kind === "skipped") {
-      skipped += 1;
-      files.push(outcome.path);
+  const localPlaylist = playlistBody
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) {
+        if (trimmed.startsWith("#EXT-X-KEY:") && keyUrl) {
+          return trimmed.replace(/URI="[^"]+"/, 'URI="enc.key"');
+        }
+        return line;
+      }
+      // Map remote segment line to local file by order.
+      const idx = localNames.findIndex((n) => n && !n.startsWith("used:"));
+      // simpler: rebuild from segments list
+      return line;
+    })
+    .join("\n");
+
+  // Rebuild a clean media playlist pointing at local files.
+  const rebuilt: string[] = ["#EXTM3U", "#EXT-X-VERSION:3"];
+  if (keyUrl) rebuilt.push('#EXT-X-KEY:METHOD=AES-128,URI="enc.key"');
+  // Copy EXTINF lines from original in order.
+  let segIndex = 0;
+  for (const rawLine of playlistBody.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("#EXTINF:")) {
+      rebuilt.push(line);
+      const name = localNames[segIndex++];
+      if (name) rebuilt.push(name);
+    } else if (line.startsWith("#EXT-X-TARGETDURATION") || line.startsWith("#EXT-X-MEDIA-SEQUENCE") || line.startsWith("#EXT-X-PLAYLIST-TYPE")) {
+      rebuilt.push(line);
+    } else if (line === "#EXT-X-ENDLIST") {
+      rebuilt.push(line);
     }
   }
+  if (!rebuilt.includes("#EXT-X-ENDLIST")) rebuilt.push("#EXT-X-ENDLIST");
+  const listPath = join(hlsDir, "local.m3u8");
+  await writeFile(listPath, `${rebuilt.join("\n")}\n`);
+  void localPlaylist;
 
-  if (files.length === tracks.length && playlistUrl) {
-    await writeFile(markerPath, playlistUrl);
+  const concatPath = join(hlsDir, "concat.txt");
+  // Prefer concat demuxer of .ts files — more reliable than encrypted local m3u8 if key path issues.
+  if (!keyUrl) {
+    await writeFile(concatPath, localNames.map((n) => `file '${n.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
+    const tmpOut = join(dir, ".tmp-out.m4b");
+    await runFfmpeg([
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      concatPath,
+      "-c",
+      "copy",
+      "-vn",
+      tmpOut,
+    ]);
+    await remuxWithChapters(tmpOut, outputPath, chapters, title);
+    await rm(tmpOut, { force: true });
+  } else {
+    const tmpOut = join(dir, ".tmp-out.m4b");
+    await runFfmpeg(["-allowed_extensions", "ALL", "-i", listPath, "-c", "copy", "-vn", tmpOut]);
+    await remuxWithChapters(tmpOut, outputPath, chapters, title);
+    await rm(tmpOut, { force: true });
   }
 
-  log.info(
-    `audio for ${book.source_id} (${book.slug}): ${downloaded} downloaded, ${skipped} skipped, ${files.length}/${tracks.length} ready`,
-  );
-
-  return { playlistUrl, tracks: tracks.length, downloaded, skipped, files };
+  // Drop bulky HLS workspace after success.
+  await rm(hlsDir, { recursive: true, force: true });
+  log.info(`remuxed ${localNames.length} segments → ${basename(outputPath)}`);
 }
 
-/** Run `fn` over items with at most `concurrency` in flight; results keep input order. */
-export async function mapPool<T, R>(
-  items: readonly T[],
-  concurrency: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const workers = Math.max(1, Math.min(concurrency, items.length || 1));
-  await Promise.all(
-    Array.from({ length: workers }, async () => {
-      for (;;) {
-        const index = next;
-        next += 1;
-        if (index >= items.length) return;
-        results[index] = await fn(items[index]!, index);
-      }
-    }),
-  );
-  return results;
+async function remuxWithChapters(
+  inputPath: string,
+  outputPath: string,
+  chapters: PlayerChapter[],
+  title: string,
+): Promise<void> {
+  const metaPath = `${outputPath}.ffmeta`;
+  await writeFile(metaPath, buildFfmetadata(chapters, title));
+  const tmp = `${outputPath}.tmp`;
+  try {
+    await runFfmpeg([
+      "-i",
+      inputPath,
+      "-i",
+      metaPath,
+      "-map_metadata",
+      "1",
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      tmp,
+    ]);
+    await rename(tmp, outputPath);
+  } finally {
+    await rm(metaPath, { force: true });
+    await rm(tmp, { force: true });
+  }
+}
+
+function safeSlug(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[^\w.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80) || "book";
+}
+
+/** @deprecated alias kept for tests */
+export function parseM3u(body: string, baseUrl?: string): Array<{ url: string; title: string | null }> {
+  const { segments } = parseHlsSegments(body, baseUrl ?? "https://example.invalid/");
+  return segments.map((url) => ({ url, title: null }));
+}
+
+export function looksLikeHtmlDocument(raw: string): boolean {
+  const head = raw.trim().slice(0, 256).toLowerCase();
+  return head.startsWith("<!doctype") || head.startsWith("<html") || head.includes("<head");
 }

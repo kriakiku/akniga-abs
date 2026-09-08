@@ -57,23 +57,18 @@ export function htmlToText($: CheerioAPI, node: AnyNode | undefined): string {
     .trim();
 }
 
-/** Support links, donation prompts and player callouts that are not part of the synopsis. */
+/** Noise lines that are not part of the book synopsis. */
 const NOISE_PATTERNS = [
-  /підтрим/i,
-  /подякувати/i,
+  /подписк/i,
+  /оформить/i,
   /buymeacoffee/i,
   /patreon/i,
-  /монобанк/i,
-  /mono\.?bank/i,
   /телеграм/i,
   /telegram/i,
+  /вконтакте/i,
   /\bдонат/i,
-  /слухати аудіокнигу/i,
-  /на плеєрі/i,
-  /на youtube/i,
-  /поділись з друзями/i,
-  /приват/i,
   /^\$/,
+  /^описание$/i,
 ];
 
 export function stripNoiseLines(text: string): string {

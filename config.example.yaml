@@ -1,7 +1,7 @@
-# 4read-abs configuration.
+# akniga-abs configuration.
 #
-# Secrets belong in environment variables, not here: ABS_URL, ABS_API_KEY,
-# FLARESOLVERR_URL all override whatever this file says.
+# Secrets belong in environment variables, not here: ABS_URL, ABS_API_KEY
+# all override whatever this file says.
 # Copy to config.yaml (or point CONFIG_FILE at it) and edit.
 #
 # The web editor omits unused keys and values that match defaults — only
@@ -22,23 +22,12 @@ paths:
   absLibrary: ""
 
 source:
-  baseUrl: https://4read.org
-  # Cloudflare on this source reacts to burst volume. The limiter starts here and
-  # backs off automatically when it gets challenged.
-  minIntervalMs: 5000
-  maxIntervalMs: 120000
-  challengeCooldownMs: 600000
+  baseUrl: https://akniga.org
+  # Pace requests politely; the limiter backs off on errors.
+  minIntervalMs: 1500
+  maxIntervalMs: 60000
+  challengeCooldownMs: 300000
   requestTimeoutMs: 45000
-
-flaresolverr:
-  # e.g. http://127.0.0.1:8191/v1 - without it, crawling stops at the first challenge.
-  url: ""
-  # auto: try a plain request first and escalate on a challenge
-  # always: send everything through FlareSolverr
-  # never: never use it
-  mode: auto
-  maxTimeoutMs: 180000
-  useSession: true
 
 audiobookshelf:
   url: ""
@@ -54,14 +43,12 @@ audiobookshelf:
   embedIntoAudioFiles: false
 
 audio:
-  # Accept/sync requests {source.baseUrl}/m33u2/{id}-{slug}.m3u and downloads listed mp3s
-  # (article basename without .html, e.g. 5546-garri-garrison-stalevyj-schur-2025-mp3).
-  # into the book folder (via Fetcher / FlareSolverr; soft-fail if missing).
+  # HLS playlist / segment downloads and ffmpeg remux into one .m4b with chapters.
   playlistTimeoutMs: 30000
-  # Per mp3 on reasd.org. 4h chapter @ 128kbps ≈ 230MB — 10m is often too short on slow links.
+  # Per segment / media file. Long books need a generous wall clock.
   # ENV: AUDIO_TRACK_TIMEOUT_MS
   trackTimeoutMs: 3600000
-  # Parallel CDN mp3 downloads within one book (ENV: AUDIO_TRACK_CONCURRENCY).
+  # Parallel CDN segment downloads within one book (ENV: AUDIO_TRACK_CONCURRENCY).
   trackConcurrency: 5
   minFileBytes: 1024
 
@@ -75,30 +62,30 @@ sync:
   # Media files are hardlinked; metadata files are always copied.
   linkMode: hardlink
   onCrossDevice: copy
-  language: ukr
-  tagPrefix: "4read"
+  language: rus
+  tagPrefix: "akniga"
   matchThreshold: 0.86
 
 narrators:
   # Ordered by preference: the first match wins when a book exists in several readings.
   prefer: []
-  #  - Характерник
-  #  - Ада Роговцева
   block: []
 
 subscriptions: []
 #  - type: series
-#    value: "all the young dudes"
+#    value: "S.T.A.L.K.E.R. Угрюмый"
 #  - type: author
-#    value: "Агата Крісті"
+#    value: "Гравицкий Алексей"
 #  - type: narrator
-#    value: "Характерник"
+#    value: "Мрак79"
+#  - type: search
+#    value: "S.T.A.L.K.E.R."
 #  - type: genre
-#    value: fentezi
+#    value: fantasy
 #    enabled: false
 
 schedule:
-  # Sitemap poll interval in minutes; 0 disables it.
+  # Incremental discovery poll interval in minutes; 0 disables it.
   incrementalMinutes: 60
   backfillEnabled: true
   # Detail pages per tick — only for subscription matches and the news queue.

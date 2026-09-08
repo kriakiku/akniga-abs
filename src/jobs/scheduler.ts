@@ -78,9 +78,7 @@ export class Scheduler {
       });
     }
 
-    // Cooldown only blocks Bun→origin probes. With FlareSolverr configured, backfill can continue.
-    const backfillBlockedByCooldown =
-      ctx.fetcher.limiter.inCooldown() && !ctx.fetcher.flareConfigured;
+    const backfillBlockedByCooldown = ctx.fetcher.limiter.inCooldown();
     if (schedule.backfillEnabled && schedule.backfillBatch > 0 && !backfillBlockedByCooldown) {
       log.info(`due: backfill (batch ${schedule.backfillBatch})`);
       await ctx.runJob("backfill", () => backfillDetails(ctx, schedule.backfillBatch)).catch((error) => {
@@ -89,7 +87,7 @@ export class Scheduler {
       });
     } else if (schedule.backfillEnabled && backfillBlockedByCooldown) {
       log.info(
-        `skipping backfill: origin cooldown another ${Math.round(ctx.fetcher.limiter.cooldownRemainingMs() / 1000)}s (no FlareSolverr)`,
+        `skipping backfill: origin cooldown another ${Math.round(ctx.fetcher.limiter.cooldownRemainingMs() / 1000)}s`,
       );
     }
 

@@ -61,11 +61,18 @@ export async function refreshQueue(ctx: AppContext, options: { crawlFacets?: boo
   // the sitemap has not been re-read yet.
   if (options.crawlFacets) {
     for (const subscription of enabled) {
+      const type = subscription.type;
       const kind =
-        subscription.type === "author" ? "avtor" : subscription.type === "narrator" ? "chitaet" : subscription.type === "series" ? "cikl" : null;
+        type === "author" || type === "narrator" || type === "series" || type === "genre" || type === "search"
+          ? type === "narrator"
+            ? "performer"
+            : type
+          : null;
       if (!kind) continue;
       try {
-        await crawlFacet(ctx, kind, subscription.value.trim().toLowerCase(), 2, subscription.value);
+        // Search/series values keep original casing; author keys are names as shown on the site.
+        const maxPages = type === "search" ? 20 : 5;
+        await crawlFacet(ctx, kind, subscription.value.trim(), maxPages, subscription.value);
       } catch (error) {
         log.warn(`facet crawl failed for ${subscription.type}:${subscription.value}: ${String(error)}`);
       }
@@ -88,6 +95,8 @@ export async function refreshQueue(ctx: AppContext, options: { crawlFacets?: boo
     for (const group of groups) {
       const book = group.best.book;
       if (group.best.blocked) continue;
+      // Skip paid books marked during detail fetch.
+      if (book.detail_state === "skipped" && book.detail_error === "paid") continue;
       booksById.set(book.source_id, book);
       const reasons = reasonsBySource.get(book.source_id) ?? new Set<string>();
       reasons.add(reason);

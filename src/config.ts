@@ -3,7 +3,7 @@ import { z } from "zod";
 import { dirname, resolve } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
 
-export const SUBSCRIPTION_TYPES = ["author", "narrator", "series", "genre", "tag"] as const;
+export const SUBSCRIPTION_TYPES = ["author", "narrator", "series", "genre", "tag", "search"] as const;
 export type SubscriptionType = (typeof SUBSCRIPTION_TYPES)[number];
 
 const subscriptionSchema = z.object({
@@ -44,29 +44,18 @@ export const configSchema = z.object({
 
   source: z
     .object({
-      baseUrl: z.string().default("https://4read.org"),
-      /** Floor for the delay between requests; the limiter backs off above this on challenges. */
-      minIntervalMs: z.number().int().min(0).default(5000),
-      maxIntervalMs: z.number().int().min(0).default(120_000),
-      /** Cooldown after a challenge that could not be solved. */
-      challengeCooldownMs: z.number().int().min(0).default(600_000),
+      baseUrl: z.string().default("https://akniga.org"),
+      /** Floor for the delay between requests; the limiter backs off above this on errors. */
+      minIntervalMs: z.number().int().min(0).default(1500),
+      maxIntervalMs: z.number().int().min(0).default(60_000),
+      /** Cooldown after repeated failures. */
+      challengeCooldownMs: z.number().int().min(0).default(300_000),
       requestTimeoutMs: z.number().int().min(1000).default(45_000),
       userAgent: z
         .string()
         .default(
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         ),
-    })
-    .prefault({}),
-
-  flaresolverr: z
-    .object({
-      /** Full endpoint, e.g. http://127.0.0.1:8191/v1 */
-      url: z.string().default(""),
-      mode: z.enum(["auto", "always", "never"]).default("auto"),
-      maxTimeoutMs: z.number().int().min(1000).default(180_000),
-      /** Reuse a FlareSolverr session so clearance survives between requests. */
-      useSession: z.boolean().default(true),
     })
     .prefault({}),
 
@@ -86,14 +75,11 @@ export const configSchema = z.object({
 
   audio: z
     .object({
-      /**
-       * Timeouts and size floor for `{source.baseUrl}/m33u2/{id}-{slug}.m3u` track downloads
-       * when Accept prepares a book / during library sync.
-       */
+      /** Timeout for HLS playlist / player AJAX. */
       playlistTimeoutMs: z.number().int().min(1000).default(30_000),
-      /** Per-track CDN download. 4h @ 128kbps ≈ 230MB; slow links need a long wall clock. */
+      /** Per-segment / media download wall clock. */
       trackTimeoutMs: z.number().int().min(1000).default(3_600_000),
-      /** How many CDN mp3s to download at once within one book (ENV: AUDIO_TRACK_CONCURRENCY). */
+      /** Parallel CDN segment downloads within one book. */
       trackConcurrency: z.number().int().min(1).max(32).default(5),
       minFileBytes: z.number().int().min(1).default(1024),
     })
@@ -111,8 +97,8 @@ export const configSchema = z.object({
       /** Media files are linked; small metadata files are always copied. */
       linkMode: z.enum(["hardlink", "copy"]).default("hardlink"),
       onCrossDevice: z.enum(["copy", "error"]).default("copy"),
-      language: z.string().default("ukr"),
-      tagPrefix: z.string().default("4read"),
+      language: z.string().default("rus"),
+      tagPrefix: z.string().default("akniga"),
       /** Minimum title/author similarity before an unlabelled item is auto-linked. */
       matchThreshold: z.number().min(0).max(1).default(0.86),
     })
@@ -130,11 +116,10 @@ export const configSchema = z.object({
 
   schedule: z
     .object({
-      /** Sitemap poll interval. Zero disables the timer. */
+      /** Discovery poll interval. Zero disables the timer. */
       incrementalMinutes: z.number().int().min(0).default(60),
       /**
        * Slowly fetch detail pages for subscription matches and queued books only.
-       * The full sitemap catalogue is never detail-crawled.
        */
       backfillEnabled: z.boolean().default(true),
       backfillBatch: z.number().int().min(0).default(25),
@@ -161,12 +146,6 @@ function envInt(name: string): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
-function envBool(name: string): boolean | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw === "") return undefined;
-  return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
-}
-
 /**
  * Environment always wins over the file. Secrets are expected to arrive this way so
  * they never end up in the YAML the web editor round-trips.
@@ -184,12 +163,6 @@ function applyEnv(config: Config): Config {
 
   c.source.minIntervalMs = envInt("SOURCE_MIN_INTERVAL_MS") ?? c.source.minIntervalMs;
   c.source.baseUrl = process.env.SOURCE_BASE_URL ?? c.source.baseUrl;
-
-  c.flaresolverr.url = process.env.FLARESOLVERR_URL ?? c.flaresolverr.url;
-  c.flaresolverr.mode =
-    (process.env.FLARESOLVERR_MODE as Config["flaresolverr"]["mode"]) ?? c.flaresolverr.mode;
-  c.flaresolverr.maxTimeoutMs = envInt("FLARESOLVERR_MAX_TIMEOUT_MS") ?? c.flaresolverr.maxTimeoutMs;
-  c.flaresolverr.useSession = envBool("FLARESOLVERR_USE_SESSION") ?? c.flaresolverr.useSession;
 
   c.audiobookshelf.url = process.env.ABS_URL ?? c.audiobookshelf.url;
   c.audiobookshelf.apiKey = process.env.ABS_API_KEY ?? c.audiobookshelf.apiKey;
@@ -284,7 +257,6 @@ function pruneAgainstDefaults(value: unknown, defaults: unknown, path: string[] 
         .filter((item): item is Record<string, unknown> => item !== undefined);
       return items.length > 0 ? items : undefined;
     }
-    // pathMappings and string lists: keep as-is when non-default
     return value;
   }
 
@@ -302,7 +274,7 @@ function pruneAgainstDefaults(value: unknown, defaults: unknown, path: string[] 
 }
 
 /**
- * YAML for the UI: unknown sections (e.g. legacy hardcover/ai) removed, defaults omitted.
+ * YAML for the UI: unknown sections removed, defaults omitted.
  * Invalid documents are returned unchanged so the editor can still show a broken file.
  */
 export function compactConfigText(text: string): string {
@@ -312,7 +284,6 @@ export function compactConfigText(text: string): string {
   let raw: unknown;
   try {
     raw = parseYaml(text) ?? {};
-    // Reject documents that would not load; keep original text editable.
     parseConfigText(text);
   } catch {
     return text;

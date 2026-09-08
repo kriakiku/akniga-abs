@@ -326,6 +326,9 @@ export async function prepareAcceptedBook(ctx: AppContext, sourceId: number): Pr
   if (!book) {
     return { ok: false, created: false, audioFiles: 0, error: "book not found" };
   }
+  if (book.detail_state === "skipped" && book.detail_error === "paid") {
+    return { ok: false, created: false, audioFiles: 0, error: "paid book — skipped" };
+  }
   if (book.detail_state !== "ok") {
     const message = `detail not ready (${book.detail_state}) — wait for Fetch details / backfill`;
     log.info(`prepare ${sourceId}: ${message}`);

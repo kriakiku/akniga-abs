@@ -20,9 +20,8 @@ export interface LimiterState {
 }
 
 /**
- * Paces requests to a single origin. Cloudflare on this source reacts to burst volume
- * rather than to a fixed rate, so the interval grows on every challenge and decays back
- * down while things are healthy.
+ * Paces requests to a single origin. The interval grows on every challenge/rate-limit
+ * response and decays back down while things are healthy.
  */
 export class AdaptiveLimiter {
   private intervalMs: number;
@@ -68,9 +67,6 @@ export class AdaptiveLimiter {
    * Serialises callers and holds each one until the pacing interval (and any cooldown) has
    * elapsed. Re-checks after sleeping so a challenge recorded by the previous caller still
    * delays the next one.
-   *
-   * Pass `ignoreCooldown` for FlareSolverr traffic: the browser client is not the same
-   * fingerprint that triggered the origin cooldown, and waiting 10 minutes would stall the crawl.
    */
   async acquire(options: { ignoreCooldown?: boolean } = {}): Promise<void> {
     const wait = this.chain.then(async () => {

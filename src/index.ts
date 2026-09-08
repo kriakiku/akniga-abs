@@ -9,17 +9,17 @@ import { VERSION } from "./version.ts";
 
 const log = logger("main");
 
-const USAGE = `4read-abs - 4read.org audiobook metadata for Audiobookshelf
+const USAGE = `akniga-abs - akniga.org audiobook metadata for Audiobookshelf
 
 Usage:
-  4read-abs [serve]        Start the web UI and the scheduler (default)
-  4read-abs seed           Fetch the author and narrator indexes
-  4read-abs sitemap        Reconcile the catalogue with the site's sitemap
-  4read-abs backfill [n]   Fetch up to n pending detail pages (default: config value)
-  4read-abs subscriptions  Re-evaluate subscriptions and refill the news queue
-  4read-abs sync           Write sidecars into the Audiobookshelf library
-  4read-abs once           sitemap, then subscriptions, then sync
-  4read-abs --version      Print the version
+  akniga-abs [serve]        Start the web UI and the scheduler (default)
+  akniga-abs seed           Fetch the author and narrator indexes
+  akniga-abs sitemap        Best-effort sitemap reconcile (subscriptions are primary)
+  akniga-abs backfill [n]   Fetch up to n pending detail pages (default: config value)
+  akniga-abs subscriptions  Re-evaluate subscriptions and refill the news queue
+  akniga-abs sync           Write sidecars into the Audiobookshelf library
+  akniga-abs once           sitemap, then subscriptions, then sync
+  akniga-abs --version      Print the version
 
 Environment:
   CONFIG_FILE              Path to config.yaml (default: ./config.yaml)
@@ -27,10 +27,8 @@ Environment:
   STAGING_DIR              Per-book staging folders (default: ./staging)
   ABS_LIBRARY_DIR          Audiobookshelf library as mounted for this process
   ABS_URL, ABS_API_KEY     Audiobookshelf server and API key
-  FLARESOLVERR_URL         FlareSolverr endpoint, e.g. http://127.0.0.1:8191/v1
-  FLARESOLVERR_MODE        auto (default) | always | never
-  AUDIO_TRACK_CONCURRENCY  Parallel CDN mp3 downloads per book (default: 5)
-  AUDIO_TRACK_TIMEOUT_MS   Per-track CDN download timeout (default: 3600000 = 1h)
+  AUDIO_TRACK_CONCURRENCY  Parallel CDN segment downloads per book (default: 5)
+  AUDIO_TRACK_TIMEOUT_MS   Per-segment CDN download timeout (default: 3600000 = 1h)
   HOST, PORT               Web UI bind address (default: 127.0.0.1:8480)
   LOG_LEVEL                debug | info | warn | error
 `;
@@ -49,9 +47,6 @@ async function serve(ctx: AppContext): Promise<void> {
 
   log.info(`web UI on http://${server.hostname}:${server.port}`);
   if (!ctx.abs.configured) log.warn("Audiobookshelf is not configured; set ABS_URL and ABS_API_KEY");
-  if (!ctx.fetcher.flareConfigured) {
-    log.warn("FlareSolverr is not configured; direct requests will fail once Cloudflare challenges");
-  }
 
   let closing = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -86,7 +81,7 @@ async function main(): Promise<void> {
     switch (command) {
       case "serve":
         await serve(ctx);
-        return; // The server keeps the process alive.
+        return;
       case "seed":
         console.log(JSON.stringify(await seedEntities(ctx), null, 2));
         break;
@@ -105,7 +100,6 @@ async function main(): Promise<void> {
         break;
       case "sync": {
         const result = await syncLibrary(ctx);
-        // The per-item detail is verbose; the summary is what matters on a terminal.
         console.log(JSON.stringify({ ...result, outcomes: result.outcomes.length }, null, 2));
         break;
       }

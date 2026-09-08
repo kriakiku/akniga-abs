@@ -1,4 +1,4 @@
-# Build the self-contained binary, then ship it on a small base image.
+# Build the self-contained binary, then ship it on a small base image with ffmpeg.
 FROM oven/bun:1 AS build
 WORKDIR /app
 
@@ -7,18 +7,18 @@ RUN bun install --frozen-lockfile
 
 COPY tsconfig.json ./
 COPY src ./src
-RUN bun build --compile --target=bun-linux-x64 --minify ./src/index.ts --outfile /out/4read-abs
+RUN bun build --compile --target=bun-linux-x64 --minify ./src/index.ts --outfile /out/akniga-abs
 
 FROM debian:bookworm-slim
-LABEL org.opencontainers.image.title="4read-abs" \
-      org.opencontainers.image.description="4read.org audiobook metadata for Audiobookshelf" \
-      org.opencontainers.image.source="https://github.com/kriakiku/4read-abs"
+LABEL org.opencontainers.image.title="akniga-abs" \
+      org.opencontainers.image.description="akniga.org audiobook metadata for Audiobookshelf" \
+      org.opencontainers.image.source="https://github.com/kriakiku/akniga-abs"
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates tzdata \
+  && apt-get install -y --no-install-recommends ca-certificates tzdata ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/4read-abs /usr/local/bin/4read-abs
+COPY --from=build /out/akniga-abs /usr/local/bin/akniga-abs
 COPY config.example.yaml /app/config.example.yaml
 
 # Writable state; mount volumes over these in production.
@@ -33,7 +33,7 @@ EXPOSE 8480
 VOLUME ["/data", "/staging", "/config", "/library"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD ["/usr/local/bin/4read-abs", "--version"]
+  CMD ["/usr/local/bin/akniga-abs", "--version"]
 
-ENTRYPOINT ["/usr/local/bin/4read-abs"]
+ENTRYPOINT ["/usr/local/bin/akniga-abs"]
 CMD ["serve"]

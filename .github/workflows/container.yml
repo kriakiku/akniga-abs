@@ -47,15 +47,14 @@ jobs:
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
             type=sha,prefix=sha-,format=short
           labels: |
-            org.opencontainers.image.title=4read-abs
-            org.opencontainers.image.description=4read.org audiobook metadata for Audiobookshelf
+            org.opencontainers.image.title=akniga-abs
+            org.opencontainers.image.description=akniga.org audiobook metadata for Audiobookshelf
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          # Dockerfile compiles bun-linux-x64 only.
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

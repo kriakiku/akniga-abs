@@ -34,5 +34,5 @@ jobs:
 
       - name: Smoke test the binary
         run: |
-          ./dist/4read-abs --version
-          ./dist/4read-abs --help > /dev/null
+          ./dist/akniga-abs --version
+          ./dist/akniga-abs --help > /dev/null

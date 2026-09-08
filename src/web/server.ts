@@ -48,8 +48,7 @@ export function createApp(ctx: AppContext): Hono {
         challenges: limiter.challenges,
         consecutiveChallenges: limiter.consecutiveChallenges,
         cooldownRemainingMs: ctx.fetcher.limiter.cooldownRemainingMs(),
-        hasClearance: ctx.fetcher.jar.hasClearance(),
-        flaresolverr: ctx.fetcher.flareConfigured ? ctx.config.flaresolverr.mode : "not configured",
+        hasSession: Boolean(ctx.fetcher.jar.phpSessionId()),
       },
       integrations: {
         audiobookshelf: ctx.abs.configured,
@@ -142,9 +141,8 @@ export function createApp(ctx: AppContext): Hono {
 
   /**
    * Serves the cover from the staging cache rather than letting the browser hit the source
-   * directly, where it would run into the same Cloudflare challenge. A cover that has not been
-   * cached yet is fetched in the background, because the source is rate limited and a UI
-   * request must not wait on it.
+   * directly. A cover that has not been cached yet is fetched in the background, because the
+   * source is rate limited and a UI request must not wait on it.
    */
   app.get("/api/covers/:sourceId", async (c) => {
     const sourceId = Number.parseInt(c.req.param("sourceId"), 10);

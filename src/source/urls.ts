@@ -1,22 +1,47 @@
-export const DEFAULT_BASE_URL = "https://4read.org";
+export const DEFAULT_BASE_URL = "https://akniga.org";
 
-/** Paths that look like categories but are site features. */
-const NON_CATEGORY_SEGMENTS = new Set([
-  "blog",
-  "tags",
-  "xfsearch",
-  "user",
-  "index.php",
-  "engine",
+/** Paths that are site features, not book slugs. */
+const RESERVED_SEGMENTS = new Set([
+  "authors",
+  "author",
+  "performers",
+  "performer",
+  "sections",
+  "section",
+  "series",
+  "search",
+  "label",
+  "ajax",
+  "api",
+  "paid",
+  "page",
+  "comments",
   "uploads",
-  "templates",
-  "m3u",
-  "bed",
-  "readers.html",
-  "avtors.html",
-  "top-100.html",
-  "sitemap.xml",
-  "rss.xml",
+  "application",
+  "rss",
+  "feed",
+  "stream",
+  "subscribe",
+  "downloads",
+  "collections",
+  "collection",
+  "sitemap",
+  "admin",
+  "profile",
+  "login",
+  "index",
+  "random",
+  "updated",
+  "studio",
+  "partner",
+  "blog",
+  "blogs",
+  "talk",
+  "wall",
+  "history",
+  "content",
+  "rest",
+  "chat",
 ]);
 
 export function absoluteUrl(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
@@ -28,67 +53,25 @@ export function absoluteUrl(href: string | undefined, base = DEFAULT_BASE_URL): 
   }
 }
 
+export function normaliseKey(raw: string): string {
+  try {
+    return decodeURIComponent(raw.replace(/\+/g, " ")).trim();
+  } catch {
+    return raw.trim();
+  }
+}
+
 export interface BookRef {
   sourceId: number;
   slug: string;
   url: string;
 }
 
-/** Article URLs are `/<id>-<slug>.html`; blog posts share the shape so callers must verify content. */
-export function parseBookUrl(href: string | undefined, base = DEFAULT_BASE_URL): BookRef | null {
-  const url = absoluteUrl(href, base);
-  if (!url) return null;
-  let path: string;
-  try {
-    path = new URL(url).pathname;
-  } catch {
-    return null;
-  }
-  const match = /^\/(\d+)-([^/]*)\.html$/.exec(path);
-  if (!match) return null;
-  const sourceId = Number.parseInt(match[1]!, 10);
-  if (!Number.isFinite(sourceId)) return null;
-  return { sourceId, slug: match[2] ?? "", url };
-}
-
-export type XfKind = "avtor" | "chitaet" | "cikl";
-
 /**
- * The site's own facet URLs double as stable identifiers: `/xfsearch/avtor/<name>/`.
- * The decoded segment is used verbatim as our key.
+ * Book URLs are `/<slug>` with a numeric id carried in `data-bid` on the page.
+ * When only a slug URL is known, sourceId may be 0 until the detail page is fetched.
  */
-export function parseXfsearchKey(href: string | undefined, kind: XfKind, base = DEFAULT_BASE_URL): string | null {
-  const url = absoluteUrl(href, base);
-  if (!url) return null;
-  let path: string;
-  try {
-    path = new URL(url).pathname;
-  } catch {
-    return null;
-  }
-  const prefix = `/xfsearch/${kind}/`;
-  if (!path.startsWith(prefix)) return null;
-  const raw = path.slice(prefix.length).replace(/\/+$/, "");
-  if (!raw) return null;
-  return normaliseKey(raw);
-}
-
-export function parseTagKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
-  const url = absoluteUrl(href, base);
-  if (!url) return null;
-  let path: string;
-  try {
-    path = new URL(url).pathname;
-  } catch {
-    return null;
-  }
-  if (!path.startsWith("/tags/")) return null;
-  const raw = path.slice("/tags/".length).replace(/\/+$/, "");
-  return raw ? normaliseKey(raw) : null;
-}
-
-/** Genre links are single-segment category paths such as `/fentezi/`. */
-export function parseCategoryKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
+export function parseBookUrl(href: string | undefined, base = DEFAULT_BASE_URL): BookRef | null {
   const url = absoluteUrl(href, base);
   if (!url) return null;
   let path: string;
@@ -99,43 +82,105 @@ export function parseCategoryKey(href: string | undefined, base = DEFAULT_BASE_U
   }
   const segments = path.split("/").filter(Boolean);
   if (segments.length !== 1) return null;
-  const segment = segments[0]!;
-  if (segment.endsWith(".html") || segment.endsWith(".xml")) return null;
-  if (NON_CATEGORY_SEGMENTS.has(segment)) return null;
-  return normaliseKey(segment);
+  const slug = segments[0]!;
+  if (slug.includes(".") && !/^[a-z0-9][\w.-]*$/i.test(slug)) return null;
+  if (RESERVED_SEGMENTS.has(slug.toLowerCase())) return null;
+  if (!/^[a-z0-9][\w.-]*$/i.test(slug)) return null;
+  return { sourceId: 0, slug, url: `${base.replace(/\/+$/, "")}/${slug}` };
 }
 
-function normaliseKey(raw: string): string {
-  let decoded = raw;
+export function bookUrl(slug: string, base = DEFAULT_BASE_URL): string {
+  return `${base.replace(/\/+$/, "")}/${slug.replace(/^\/+/, "")}`;
+}
+
+export function parseAuthorKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
+  return parsePrefixedKey(href, "/author/", base);
+}
+
+export function parsePerformerKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
+  return parsePrefixedKey(href, "/performer/", base);
+}
+
+export function parseSeriesKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
+  return parsePrefixedKey(href, "/series/", base);
+}
+
+export function parseSectionKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
+  return parsePrefixedKey(href, "/section/", base);
+}
+
+export function parseLabelKey(href: string | undefined, base = DEFAULT_BASE_URL): string | null {
+  const url = absoluteUrl(href, base);
+  if (!url) return null;
+  let path: string;
   try {
-    decoded = decodeURIComponent(raw);
+    path = new URL(url).pathname;
   } catch {
-    // Leave malformed escapes as-is rather than dropping the entity.
+    return null;
   }
-  return decoded.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!path.startsWith("/label/")) return null;
+  const raw = path.slice("/label/".length).replace(/\/+$/, "");
+  return raw ? normaliseKey(raw) : null;
 }
 
-export function xfsearchUrl(kind: XfKind, key: string, page = 1, base = DEFAULT_BASE_URL): string {
-  const encoded = encodeURIComponent(key);
-  const suffix = page > 1 ? `page/${page}/` : "";
-  return `${base}/xfsearch/${kind}/${encoded}/${suffix}`;
+function parsePrefixedKey(href: string | undefined, prefix: string, base: string): string | null {
+  const url = absoluteUrl(href, base);
+  if (!url) return null;
+  let path: string;
+  try {
+    path = new URL(url).pathname;
+  } catch {
+    return null;
+  }
+  if (!path.startsWith(prefix)) return null;
+  const raw = path.slice(prefix.length).replace(/\/+$/, "");
+  if (!raw) return null;
+  return normaliseKey(raw);
 }
 
-export function categoryUrl(key: string, page = 1, base = DEFAULT_BASE_URL): string {
-  const suffix = page > 1 ? `page/${page}/` : "";
-  return `${base}/${key}/${suffix}`;
+export function authorUrl(name: string, base = DEFAULT_BASE_URL): string {
+  return `${base.replace(/\/+$/, "")}/author/${encodeURIComponent(name)}/`;
 }
 
-export function bookUrl(sourceId: number, slug: string, base = DEFAULT_BASE_URL): string {
-  return `${base}/${sourceId}-${slug}.html`;
+export function performerUrl(name: string, base = DEFAULT_BASE_URL): string {
+  return `${base.replace(/\/+$/, "")}/performer/${encodeURIComponent(name)}/`;
 }
 
-/** `05:28:52` or `1:02` into seconds. */
-export function parseDurationToSeconds(value: string | undefined | null): number | null {
-  if (!value) return null;
-  const parts = value.trim().split(":").map((p) => Number.parseInt(p, 10));
-  if (parts.length === 0 || parts.some((p) => !Number.isFinite(p))) return null;
-  let seconds = 0;
-  for (const part of parts) seconds = seconds * 60 + (part as number);
-  return seconds > 0 ? seconds : null;
+export function seriesUrl(name: string, base = DEFAULT_BASE_URL): string {
+  return `${base.replace(/\/+$/, "")}/series/${encodeURIComponent(name)}/`;
+}
+
+export function sectionUrl(key: string, base = DEFAULT_BASE_URL): string {
+  return `${base.replace(/\/+$/, "")}/section/${encodeURIComponent(key)}/`;
+}
+
+export function searchBooksUrl(query: string, page = 1, base = DEFAULT_BASE_URL): string {
+  const root = base.replace(/\/+$/, "");
+  const q = encodeURIComponent(query);
+  if (page <= 1) return `${root}/search/books/?q=${q}`;
+  return `${root}/search/books/page${page}/?q=${q}`;
+}
+
+/** Duration like `12:34:56`, `1:02:03`, or `45:00`. */
+export function parseDurationToSeconds(raw: string | undefined | null): number | null {
+  if (!raw) return null;
+  const text = raw.trim();
+  const match = /^(\d+):(\d{1,2})(?::(\d{1,2}))?$/.exec(text);
+  if (!match) {
+    const asNumber = Number.parseInt(text, 10);
+    return Number.isFinite(asNumber) && asNumber > 0 ? asNumber : null;
+  }
+  const a = Number.parseInt(match[1]!, 10);
+  const b = Number.parseInt(match[2]!, 10);
+  const c = match[3] !== undefined ? Number.parseInt(match[3], 10) : null;
+  if (c === null) return a * 60 + b;
+  return a * 3600 + b * 60 + c;
+}
+
+/** Pull trailing `(N)` volume number from series link text. */
+export function parseSeriesSequence(label: string): { name: string; sequence: string | null } {
+  const trimmed = label.replace(/\s+/g, " ").trim();
+  const match = /^(.*?)\s*\((\d+)\)\s*$/.exec(trimmed);
+  if (!match) return { name: trimmed, sequence: null };
+  return { name: match[1]!.trim(), sequence: match[2]! };
 }

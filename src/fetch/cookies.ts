@@ -4,7 +4,7 @@ export interface StoredCookie {
   name: string;
   value: string;
   expires?: number;
-  /** Host-only or leading-dot domain from Set-Cookie / FlareSolverr. */
+  /** Host-only or leading-dot domain from Set-Cookie. */
   domain?: string;
 }
 
@@ -31,11 +31,8 @@ export function cookieDomainMatchesHost(cookieDomain: string | undefined, host: 
 }
 
 /**
- * Single-process cookie jar persisted in SQLite. Cloudflare clearance is expensive to
- * obtain, so it has to survive restarts.
- *
- * Cookies are keyed by (domain, name) so `cf_clearance` for 4read.org and reasd.org
- * can coexist. Legacy entries without `domain` apply only to `primaryHost`.
+ * Single-process cookie jar persisted in SQLite so LiveStreet session cookies survive restarts.
+ * Cookies are keyed by (domain, name). Legacy entries without `domain` apply only to `primaryHost`.
  */
 export class CookieJar {
   private cookies = new Map<string, StoredCookie>();
@@ -84,7 +81,7 @@ export class CookieJar {
     return this.list(forUrl).some((c) => c.name === "cf_clearance" && Boolean(c.value));
   }
 
-  /** PHP session id from the last successful 4read response, if we have one. */
+  /** PHP session id from the last successful origin response, if we have one. */
   phpSessionId(): string | null {
     const cookies = this.list(this.primaryHost ? `https://${this.primaryHost}/` : undefined);
     const value = cookies.find((c) => c.name === "PHPSESSID")?.value?.trim();
@@ -100,7 +97,7 @@ export class CookieJar {
     for (const cookie of cookies) {
       if (!cookie.name) continue;
       const key = this.key(cookie.name, cookie.domain);
-      // FlareSolverr sometimes returns an empty PHPSESSID in a partial dump — keep the last good one.
+      // Keep the last good PHPSESSID if a blank one arrives.
       if (cookie.name === "PHPSESSID" && !cookie.value?.trim()) {
         const existing = this.cookies.get(key) ?? [...this.cookies.values()].find((c) => c.name === "PHPSESSID");
         if (existing?.value?.trim()) continue;
@@ -168,7 +165,7 @@ export class CookieJar {
 
   /**
    * Cookie header for Bun fetch. Without `forUrl`, uses primary host (source site).
-   * Never mixes CDN clearance into 4read requests or vice versa.
+   * Never mixes CDN cookies into origin requests or vice versa.
    */
   header(forUrl?: string): string | undefined {
     const cookies = this.list(forUrl);
@@ -180,7 +177,6 @@ export class CookieJar {
   }
 
   /**
-   * Snapshot for FlareSolverr `cookies` payloads.
    * When `forUrl` is set, only cookies that belong on that host (CDN vs source).
    */
   list(forUrl?: string): StoredCookie[] {
@@ -206,7 +202,7 @@ export class CookieJar {
         if (cookieDomainMatchesHost(cookie.domain, host)) out.push({ ...cookie });
         continue;
       }
-      // Legacy undomain entries: only the primary (4read) host — never the CDN.
+      // Legacy undomain entries: only the primary host — never the CDN.
       if (this.primaryHost && (host === this.primaryHost || host.endsWith(`.${this.primaryHost}`))) {
         out.push({ ...cookie });
       }

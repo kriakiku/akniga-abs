@@ -1,7 +1,7 @@
 {
-  "name": "4read-abs",
-  "version": "0.1.47",
-  "description": "Scraper for 4read.org audiobook metadata with Audiobookshelf sidecar sync and subscriptions",
+  "name": "akniga-abs",
+  "version": "0.1.0",
+  "description": "Scraper for akniga.org audiobook metadata with Audiobookshelf sidecar sync and subscriptions",
   "private": true,
   "type": "module",
   "module": "src/index.ts",
@@ -10,7 +10,7 @@
     "dev": "bun --watch src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build --compile --target=bun-linux-x64 --minify --sourcemap ./src/index.ts --outfile dist/4read-abs"
+    "build": "bun build --compile --target=bun-linux-x64 --minify --sourcemap ./src/index.ts --outfile dist/akniga-abs"
   },
   "dependencies": {
     "cheerio": "^1.1.2",

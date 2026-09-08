@@ -8,7 +8,7 @@ import { CooldownError, type Fetcher } from "./fetch/fetcher.ts";
 
 const log = logger("cover");
 
-const COVER_MARKER = ".4read-cover-source";
+const COVER_MARKER = ".akniga-cover-source";
 const EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"] as const;
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -45,7 +45,7 @@ export async function cachedCover(book: BookWithPeople, config: Config): Promise
   return null;
 }
 
-/** Cover URL from the source listing (4read). */
+/** Cover URL from the source listing (akniga). */
 export function preferredCoverUrl(book: BookWithPeople, _config?: Config): string | null {
   return book.cover_url?.trim() || null;
 }
@@ -67,9 +67,6 @@ export interface DownloadedCover {
 /**
  * Download the cover unless the staging folder already holds the one for this exact URL.
  * Returns null when nothing needs to be written, which callers treat as "keep what is there".
- *
- * Source cover URLs share 4read's Cloudflare zone; Bun cannot reuse FlareSolverr clearance
- * cookies (TLS fingerprint), so fetches go through the Fetcher.
  */
 export async function downloadCoverIfStale(
   fetcher: Fetcher,
