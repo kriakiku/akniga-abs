@@ -455,17 +455,21 @@ function createSegmentProgress(sourceId: number, total: number) {
   let done = 0;
   let skipped = 0;
   let lastLogAt = 0;
+  let lastLoggedDone = -1;
   const step = Math.max(1, Math.min(25, Math.ceil(total / 10)));
 
   const emit = (force = false) => {
     const now = Date.now();
     if (!force && done < total && done % step !== 0 && now - lastLogAt < 15_000) return;
+    if (force && done === total && lastLoggedDone === total) return;
     lastLogAt = now;
+    lastLoggedDone = done;
     const left = total - done;
     const elapsedSec = Math.max(0.001, (now - startedAt) / 1000);
     const rate = done / elapsedSec;
-    const etaSec = rate > 0 && left > 0 ? Math.round(left / rate) : null;
-    const eta = etaSec === null ? "?" : etaSec < 60 ? `${etaSec}s` : `${Math.round(etaSec / 60)}m`;
+    const etaSec = left === 0 ? 0 : rate > 0 ? Math.round(left / rate) : null;
+    const eta =
+      etaSec === null ? "?" : etaSec === 0 ? "0s" : etaSec < 60 ? `${etaSec}s` : `${Math.round(etaSec / 60)}m`;
     const skipNote = skipped > 0 ? `, ${skipped} cached` : "";
     log.info(
       `audio ${sourceId}: segments ${done}/${total} (${left} left, ~${eta})${skipNote}`,
@@ -491,8 +495,9 @@ async function remuxWithChapters(
   title: string,
 ): Promise<void> {
   const metaPath = `${outputPath}.ffmeta`;
+  // Keep a real media extension on the temp file — ffmpeg cannot sniff format from `.m4b.tmp`.
+  const tmp = `${outputPath}.tmp.m4b`;
   await writeFile(metaPath, buildFfmetadata(chapters, title));
-  const tmp = `${outputPath}.tmp`;
   try {
     await runFfmpeg([
       "-i",
@@ -505,6 +510,8 @@ async function remuxWithChapters(
       "copy",
       "-movflags",
       "+faststart",
+      "-f",
+      "mp4",
       tmp,
     ]);
     await rename(tmp, outputPath);
